@@ -1,0 +1,23 @@
+# Ignore outputs directories created by training
+/outputs/
+/outputs_accelerate/
+/outputs_accelerate_v2/
+
+# Python
+*.py[cod]
+*.so
+*.egg-info/
+venv/
+env/
+ENV/
+.env
+.env.*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VSCode
+.vscode/
+
+# OS
+.DS_Store

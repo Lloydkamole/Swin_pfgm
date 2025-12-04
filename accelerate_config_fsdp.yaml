@@ -1,0 +1,53 @@
+# Accelerate config for FSDP (Fully Sharded Data Parallel)
+# Use: accelerate launch --config_file accelerate_config_fsdp.yaml train_accelerate.py
+
+compute_environment: LOCAL_MACHINE
+debug: false
+distributed_type: FSDP
+downcast_bf16: 'no'
+enable_cpu_affinity: false
+gpu_ids: 0,1
+machine_rank: 0
+main_training_function: main
+mixed_precision: 'no'
+num_machines: 1
+num_processes: 2
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
+
+# FSDP Configuration
+fsdp_config:
+  # Sharding strategy: FULL_SHARD (most memory efficient), SHARD_GRAD_OP, NO_SHARD
+  fsdp_sharding_strategy: FULL_SHARD
+  
+  # Offload params and optimizer states to CPU (saves GPU memory but slower)
+  fsdp_offload_params: false
+  
+  # Auto wrap policy - transformer_based_wrap works well for transformer models
+  # Can also use: size_based_wrap, no_wrap
+  fsdp_auto_wrap_policy: SIZE_BASED_WRAP
+  
+  # Minimum number of parameters for a layer to be wrapped (for size-based)
+  fsdp_min_num_params: 1000000
+  
+  # Backward prefetch strategy: BACKWARD_PRE, BACKWARD_POST, NO_PREFETCH  
+  fsdp_backward_prefetch: BACKWARD_PRE
+  
+  # State dict type for checkpointing: FULL_STATE_DICT, SHARDED_STATE_DICT, LOCAL_STATE_DICT
+  fsdp_state_dict_type: FULL_STATE_DICT
+  
+  # Forward prefetch (can help with performance)
+  fsdp_forward_prefetch: false
+  
+  # Use original params (easier checkpointing but may use more memory)
+  fsdp_use_orig_params: true
+  
+  # Sync module states at start
+  fsdp_sync_module_states: true
+  
+  # CPU RAM efficient loading
+  fsdp_cpu_ram_efficient_loading: true
