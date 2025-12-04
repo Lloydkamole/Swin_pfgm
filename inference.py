@@ -56,7 +56,7 @@ INFERENCE_CONFIG = {
     
     # ---------- SAMPLING PARAMETERS ----------
     "num_steps": 50,             # Number of sampling steps (more = better quality, slower)
-    "cfg_scale": 3.0,            # Classifier-free guidance scale (1.0 = no guidance, try 1.5-3.0)
+    "cfg_scale": 2.0,            # Classifier-free guidance scale (1.0 = no guidance, try 1.5-3.0)
     "batch_size": 12,             # Batch size for slice processing
     "target_size": 256,          # Target size for 2D slices
     

@@ -74,9 +74,9 @@ config = {
     # Model Architecture
     "model_config": "custom", # "custom" or predefined config name
     "base_channels": 64,   
-    "channel_mults": [1, 2, 4, 8],
+    "channel_mults": [1, 2, 4],
     "num_res_blocks": 2,
-    "attention_resolutions": [2, 4, 8],  # Downsample factors for attention
+    "attention_resolutions": [2, 4],  # Downsample factors for attention
     "num_heads": 4,
     "mlp_ratio": 4.0, # MLP expansion ratio in transformer blocks
     "radius_emb_dim": 256,
@@ -93,6 +93,10 @@ config = {
     "P_std": 1.2,
     "rho": 7.0,
     "loss_type": "l2",
+    
+    # Classifier-Free Guidance (CFG)
+    "cond_drop_prob": 0.0,               # Probability of dropping MRI conditioning (0.0 = no CFG)
+    "cfg_scale": 3.0,                    # Guidance scale at inference (1.0 = no guidance)
     
     # Training Parameters
     "num_epochs": 100,
@@ -228,10 +232,29 @@ def edm_loss(
     sigma: torch.Tensor,
     sigma_data: float = 0.5,
     loss_type: str = 'l2',
+    cond_drop_prob: float = 0.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Compute EDM-style loss."""
+    """
+    Compute EDM-style loss with optional classifier-free guidance training.
+    
+    Args:
+        cond_drop_prob: Probability of dropping MRI conditioning (replacing with zeros).
+                        Set to 0.0 to disable CFG training.
+    
+    Returns:
+        loss: Scalar loss value
+        metrics: Dictionary of metrics for logging
+    """
     n = torch.randn_like(x_clean) * sigma.view(-1, 1, 1, 1)
     x_noisy = x_clean + n
+    
+    # Classifier-free guidance: randomly drop conditioning
+    if cond_drop_prob > 0.0 and model.training:
+        # Create mask for which samples drop conditioning
+        drop_mask = torch.rand(mri.shape[0], device=mri.device) < cond_drop_prob
+        # Zero out MRI for dropped samples
+        mri = mri.clone()
+        mri[drop_mask] = 0.0
     
     D_x = edm_precond(model, x_noisy, mri, sigma, sigma_data)
     
@@ -280,6 +303,7 @@ def edm_sample(
     S_max: float = float('inf'),
     S_noise: float = 1.0,
     return_trajectory_stats: bool = False,
+    cfg_scale: float = 1.0,
 ) -> torch.Tensor:
     """
     Generate CT images from MRI using EDM sampling (Algorithm 2 from EDM paper).
@@ -288,6 +312,8 @@ def edm_sample(
     
     Args:
         return_trajectory_stats: If True, returns (samples, stats_dict) with ODE trajectory info
+        cfg_scale: Classifier-free guidance scale. 1.0 = no guidance, >1.0 = stronger conditioning.
+                   Requires model trained with cond_drop_prob > 0.
     """
     B, C, H, W = mri.shape
     device = mri.device
@@ -313,14 +339,31 @@ def edm_sample(
         x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * torch.randn_like(x_cur)
         
         sigma_batch = torch.full((B,), t_hat.item(), device=device, dtype=torch.float32)
-        denoised = edm_precond(model, x_hat.float(), mri, sigma_batch, sigma_data).double()
+        denoised_cond = edm_precond(model, x_hat.float(), mri, sigma_batch, sigma_data).double()
+        
+        # Classifier-free guidance
+        if cfg_scale != 1.0:
+            mri_uncond = torch.zeros_like(mri)
+            denoised_uncond = edm_precond(model, x_hat.float(), mri_uncond, sigma_batch, sigma_data).double()
+            denoised = denoised_uncond + cfg_scale * (denoised_cond - denoised_uncond)
+        else:
+            denoised = denoised_cond
+        
         d_cur = (x_hat - denoised) / t_hat
         update = (t_next - t_hat) * d_cur
         x_next = x_hat + update
         
         if i < num_steps - 1 and t_next > 0:
             sigma_batch = torch.full((B,), t_next.item(), device=device, dtype=torch.float32)
-            denoised_next = edm_precond(model, x_next.float(), mri, sigma_batch, sigma_data).double()
+            denoised_cond_next = edm_precond(model, x_next.float(), mri, sigma_batch, sigma_data).double()
+            
+            # CFG for Heun correction
+            if cfg_scale != 1.0:
+                denoised_uncond_next = edm_precond(model, x_next.float(), mri_uncond, sigma_batch, sigma_data).double()
+                denoised_next = denoised_uncond_next + cfg_scale * (denoised_cond_next - denoised_uncond_next)
+            else:
+                denoised_next = denoised_cond_next
+            
             d_prime = (x_next - denoised_next) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
         
@@ -609,7 +652,8 @@ def train(cfg: dict):
                 loss, metrics = edm_loss(
                     model, ct, mr, sigma,
                     sigma_data=cfg["sigma_data"],
-                    loss_type=cfg["loss_type"]
+                    loss_type=cfg["loss_type"],
+                    cond_drop_prob=cfg.get("cond_drop_prob", 0.0),
                 )
                 
                 accelerator.backward(loss)
@@ -696,6 +740,7 @@ def train(cfg: dict):
                         sigma_data=cfg["sigma_data"],
                         rho=cfg["rho"],
                         return_trajectory_stats=True,
+                        cfg_scale=cfg.get("cfg_scale", 1.0),
                     )
                     # Log ODE trajectory stats
                     accelerator.log({
@@ -713,6 +758,7 @@ def train(cfg: dict):
                         sigma_max=cfg["sigma_max"],
                         sigma_data=cfg["sigma_data"],
                         rho=cfg["rho"],
+                        cfg_scale=cfg.get("cfg_scale", 1.0),
                     )
                 
                 pred_ct = torch.clamp(pred_ct, -1.0, 1.0)
@@ -805,6 +851,7 @@ def train(cfg: dict):
                     sigma_max=cfg["sigma_max"],
                     sigma_data=cfg["sigma_data"],
                     rho=cfg["rho"],
+                    cfg_scale=cfg.get("cfg_scale", 1.0),
                 )
                 
                 pred_val_ct = torch.clamp(pred_val_ct, -1.0, 1.0)
