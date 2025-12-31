@@ -28,6 +28,14 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import nibabel as nib
 
+# MONAI transforms for consistent data loading (matching training)
+from monai.transforms import (
+    Compose,
+    LoadImaged,
+    EnsureChannelFirstd,
+    Orientationd,
+)
+
 # Import model
 from models import create_swin_fir_unet
 
@@ -43,8 +51,8 @@ from safetensors.torch import load_file as load_safetensors
 INFERENCE_CONFIG = {
     # ---------- INPUT/OUTPUT PATHS ----------
     # For single file inference:
-    "input_mri": "/home/lloyd/Documents/AR PFGM/test_pfgm/1PA177/mr.nii_processed_patch.nii.gz",           # e.g., "/path/to/patient/mr.nii.gz"
-    "output_ct": "/home/lloyd/Documents/AR PFGM/test_pfgm/1PA177/pred_ct.nii.gz",           # e.g., "/path/to/patient/pred_ct.nii.gz" (auto-generated if None)
+    "input_mri": "/home/lloyd/Documents/AR PFGM/test_pfgm/1PA180/mr.nii_processed_patch.nii.gz",           # e.g., "/path/to/patient/mr.nii.gz"
+    "output_ct": "/home/lloyd/Documents/AR PFGM/test_pfgm/1PA180/pred_ct.nii.gz",           # e.g., "/path/to/patient/pred_ct.nii.gz" (auto-generated if None)
     
     # For batch/directory inference (overrides single file if set):
     "input_dir": None,           # e.g., "/path/to/patients_folder"
@@ -52,10 +60,10 @@ INFERENCE_CONFIG = {
     "mr_pattern": "mr.nii",      # Pattern to match MRI files in directory mode
     
     # ---------- CHECKPOINT PATH ----------
-    "checkpoint": "/home/lloyd/Documents/MDLM_unet/MDLM_UNET/pfgm_fir/outputs_accelerate/20251202_151658_pfgm_fir/checkpoints/best",
+    "checkpoint": "/home/lloyd/Documents/MDLM_unet/MDLM_UNET/pfgm_fir/outputs_accelerate/20251204_031357_pfgm_fir/checkpoints/best",
     
     # ---------- SAMPLING PARAMETERS ----------
-    "num_steps": 50,             # Number of sampling steps (more = better quality, slower)
+    "num_steps": 100,             # Number of sampling steps (more = better quality, slower)
     "cfg_scale": 2.0,            # Classifier-free guidance scale (1.0 = no guidance, try 1.5-3.0)
     "batch_size": 12,             # Batch size for slice processing
     "target_size": 256,          # Target size for 2D slices
@@ -72,17 +80,17 @@ INFERENCE_CONFIG = {
 # =============================================================================
 
 DEFAULT_MODEL_CONFIG = {
-    # Model Architecture
+    # Model Architecture - MUST MATCH TRAINING CONFIG (train_accelerate.py)
     "base_channels": 64,
-    "channel_mults": [1, 2, 4, 8],
-    "num_res_blocks": 2,
-    "attention_resolutions": [2, 4, 8],
+    "channel_mults": [1, 2, 4, 8],  # From train_accelerate.py
+    "num_res_blocks": 3,
+    "attention_resolutions": [2, 4, 8],  # From train_accelerate.py
     "num_heads": 4,
     "mlp_ratio": 4.0,
     "radius_emb_dim": 256,
     "window_size": 4,
     "use_sfb": True,
-    "dropout": 0.0,
+    "dropout": 0.0,  # Match training
     "drop_path": 0.1,
     
     # EDM Parameters
@@ -312,6 +320,11 @@ def load_mri_volume(
     """
     Load MRI NIfTI volume and prepare for inference.
     
+    Uses the SAME MONAI transforms as training (loader.py) to ensure consistent preprocessing:
+    - LoadImaged: Load NIfTI file
+    - EnsureChannelFirstd: Add channel dimension
+    - Orientationd: Reorient to RAS standard orientation
+    
     Args:
         mri_path: Path to MRI NIfTI file
         target_size: Target size for 2D slices
@@ -321,56 +334,59 @@ def load_mri_volume(
     """
     print(f"Loading MRI: {mri_path}")
     
-    # Load NIfTI
-    nii = nib.load(mri_path)
-    mri_data = nii.get_fdata()
+    # Keep original NIfTI for saving output with same affine/header
+    original_nii = nib.load(mri_path)
+    original_shape = original_nii.shape
     
-    # Store original info for saving
-    original_affine = nii.affine
-    original_header = nii.header
-    original_shape = mri_data.shape
+    # Use MONAI transforms EXACTLY matching training (loader.py)
+    # This ensures consistent preprocessing: orientation, channel order, etc.
+    inference_transforms = Compose([
+        LoadImaged(keys=["mr"], image_only=True),
+        EnsureChannelFirstd(keys=["mr"]),
+        Orientationd(keys=["mr"], axcodes="RAS"),  # Critical: match training orientation
+    ])
+    
+    # Apply transforms
+    data = inference_transforms({"mr": mri_path})
+    mri_vol = data["mr"]  # [C, H, W, D] tensor
+    
+    # Convert to numpy if needed
+    if isinstance(mri_vol, torch.Tensor):
+        mri_data = mri_vol.numpy()
+    else:
+        mri_data = np.array(mri_vol)
     
     print(f"  Original shape: {original_shape}")
+    print(f"  After MONAI transforms: {mri_data.shape} (C, H, W, D)")
     print(f"  Value range: [{mri_data.min():.3f}, {mri_data.max():.3f}]")
     
-    # Handle different dimensionalities
-    if len(original_shape) == 4:
-        # 4D volume (e.g., [H, W, D, T]), take first timepoint
-        mri_data = mri_data[..., 0]
-        print(f"  4D volume detected, using first timepoint. New shape: {mri_data.shape}")
-    
-    # Normalize to [-1, 1] range (assuming data is already 0-1 or will be normalized)
-    # Adjust based on your data preprocessing
-    mri_min, mri_max = mri_data.min(), mri_data.max()
-    if mri_max > mri_min:
-        mri_data = (mri_data - mri_min) / (mri_max - mri_min)  # 0-1
-        mri_data = mri_data * 2.0 - 1.0  # -1 to 1
-    
-    # Process slices
+    # Process slices from the [C, H, W, D] volume
+    # C=0 since we have single channel
     num_slices = mri_data.shape[-1]
     slices = []
     
     for s in range(num_slices):
-        slice_2d = mri_data[:, :, s]
+        # Extract slice: [C, H, W, D] -> [C, H, W]
+        slice_2d = mri_data[:, :, :, s]  # [C, H, W]
         
-        # Convert to tensor and add channel dimension
-        slice_tensor = torch.from_numpy(slice_2d).float().unsqueeze(0)  # [1, H, W]
+        # Convert to tensor
+        slice_tensor = torch.from_numpy(slice_2d).float()  # [C, H, W]
         
-        # Resize if needed
+        # Resize if needed (matching training loader)
         h, w = slice_tensor.shape[1], slice_tensor.shape[2]
         if h != target_size or w != target_size:
             slice_tensor = F.interpolate(
-                slice_tensor.unsqueeze(0),
+                slice_tensor.unsqueeze(0),  # [1, C, H, W]
                 size=(target_size, target_size),
                 mode='bilinear',
                 align_corners=False
-            ).squeeze(0)
+            ).squeeze(0)  # [C, H, W]
         
         slices.append(slice_tensor)
     
     print(f"  Prepared {num_slices} slices at {target_size}x{target_size}")
     
-    return slices, nii, original_shape
+    return slices, original_nii, original_shape
 
 
 class SliceDataset(Dataset):
@@ -465,7 +481,7 @@ def generate_ct_volume(
                 cfg_scale=cfg_scale,
             )
         
-        # Clamp to valid range
+        # Clamp to valid range (model outputs in [-1, 1] range)
         batch_ct = torch.clamp(batch_ct, -1.0, 1.0)
         
         # Store individual slices with their indices
@@ -528,9 +544,7 @@ def save_ct_volume(
         ct_tensor = torch.stack(resized_slices, dim=0).squeeze(1)  # [D, H, W]
         ct_volume = ct_tensor.numpy().transpose(1, 2, 0)  # [H, W, D]
     
-    # Convert from [-1, 1] to output range
-    # Adjust this based on your expected CT value range
-    ct_volume = (ct_volume + 1.0) / 2.0  # [0, 1]
+    # Keep output values as-is from the model (no conversion)
     
     print(f"  Final shape: {ct_volume.shape}")
     print(f"  Value range: [{ct_volume.min():.3f}, {ct_volume.max():.3f}]")
@@ -733,8 +747,8 @@ def parse_args():
         help="Model base channels"
     )
     parser.add_argument(
-        "--channel_mults", type=str, default="1,2,4,8",
-        help="Channel multipliers (comma-separated)"
+        "--channel_mults", type=str, default="1,2,4",
+        help="Channel multipliers (comma-separated) - must match training config"
     )
     
     # Sampling parameters

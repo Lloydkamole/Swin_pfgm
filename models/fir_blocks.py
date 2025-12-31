@@ -261,25 +261,31 @@ class FIRResBlock(nn.Module):
     """
     FIR Residual Block: Core building block for PFGM-FIR.
     
-    Combines:
-    1. Convolution with radius conditioning (FiLM)
-    2. Optional Swin Transformer attention
-    3. SFB residual connection for global receptive field
+    Sequential architecture following SwinFIR design:
+    1. Conv with radius conditioning (FiLM) - injects noise level info BEFORE attention
+    2. Swin Transformer attention blocks (sequential)
+    3. SFB blocks (sequential) for global receptive field
+    4. Residual connection back to input
     
-    This block processes features while being conditioned on the PFGM++ radius
-    parameter, enabling the network to adapt its behavior based on noise level.
+    Flow: input → conv+FiLM → Swin blocks → SFB blocks → + input → output
+    
+    This is different from the parallel approach - here Swin and SFB are sequential,
+    matching the original SwinFIR paper design.
     
     Args:
         in_channels: Number of input channels.
         out_channels: Number of output channels.
         radius_emb_dim: Dimension of radius embedding.
         use_swin: Whether to use Swin attention.
-        use_sfb: Whether to use SFB for residual (vs simple conv).
+        use_sfb: Whether to use SFB blocks.
         input_resolution: (H, W) for Swin attention.
         num_heads: Number of attention heads.
         window_size: Window size for Swin attention.
         mlp_ratio: MLP expansion ratio.
         drop_path: Stochastic depth rate.
+        dropout: Dropout rate.
+        num_swin_blocks: Number of Swin blocks (W-MSA + SW-MSA pattern).
+        num_sfb_blocks: Number of SFB blocks applied after Swin.
     """
     
     def __init__(
@@ -295,6 +301,8 @@ class FIRResBlock(nn.Module):
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
         dropout: float = 0.0,
+        num_swin_blocks: int = 2,
+        num_sfb_blocks: int = 1,
     ):
         super().__init__()
         
@@ -302,19 +310,20 @@ class FIRResBlock(nn.Module):
         self.out_channels = out_channels
         self.use_swin = use_swin
         self.use_sfb = use_sfb
+        self.num_swin_blocks = num_swin_blocks
+        self.num_sfb_blocks = num_sfb_blocks
         
         # Helper function for flexible GroupNorm
         def get_num_groups(channels, target=32):
             """Get a valid number of groups for GroupNorm."""
             if channels >= target and channels % target == 0:
                 return target
-            # Find largest divisor <= 32
             for g in [32, 16, 8, 4, 2, 1]:
                 if channels % g == 0:
                     return g
             return 1
         
-        # First conv block
+        # === Stage 1: Conv + FiLM (radius conditioning BEFORE attention) ===
         self.norm1 = nn.GroupNorm(get_num_groups(in_channels), in_channels)
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         
@@ -324,47 +333,45 @@ class FIRResBlock(nn.Module):
             nn.Linear(radius_emb_dim, out_channels * 2),
         )
         
-        # Second conv block
-        self.norm2 = nn.GroupNorm(get_num_groups(out_channels), out_channels)
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        
-        # Optional Swin attention
-        if use_swin:
+        # === Stage 2: Swin Transformer Attention (sequential) ===
+        if use_swin and num_swin_blocks > 0:
             self.swin_blocks = nn.ModuleList([
                 SwinTransformerBlock(
                     dim=out_channels,
                     input_resolution=input_resolution,
                     num_heads=num_heads,
                     window_size=window_size,
-                    shift_size=0 if i % 2 == 0 else window_size // 2,
+                    shift_size=0 if i % 2 == 0 else window_size // 2,  # W-MSA / SW-MSA alternating
                     mlp_ratio=mlp_ratio,
                     drop_path=drop_path,
                 )
-                for i in range(2)  # Two Swin blocks (W-MSA + SW-MSA)
+                for i in range(num_swin_blocks)
             ])
         else:
             self.swin_blocks = None
         
-        # Residual connection with SFB or conv
-        if use_sfb:
-            self.residual = SFB(out_channels)
+        # === Stage 3: SFB Blocks (sequential, applied AFTER Swin) ===
+        if use_sfb and num_sfb_blocks > 0:
+            self.sfb_blocks = nn.ModuleList([
+                SFB(out_channels)
+                for _ in range(num_sfb_blocks)
+            ])
         else:
-            self.residual = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+            self.sfb_blocks = None
         
-        # Skip connection (if channels change)
+        # === Skip connection (if channels change) ===
         if in_channels != out_channels:
             self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1)
         else:
             self.skip = nn.Identity()
         
-        # Residual scaling factor for stability (1/sqrt(2) prevents accumulation)
+        # Residual scaling factor for stability
         self.residual_scale = 1.0 / math.sqrt(2)
         
-        # Initialize last conv to zero for better training dynamics
-        nn.init.zeros_(self.conv2.weight)
-        if self.conv2.bias is not None:
-            nn.init.zeros_(self.conv2.bias)
+        # Initialize conv to small values for better training dynamics
+        nn.init.kaiming_normal_(self.conv1.weight, mode='fan_out', nonlinearity='relu')
+        if self.conv1.bias is not None:
+            nn.init.zeros_(self.conv1.bias)
     
     def forward(
         self,
@@ -373,7 +380,7 @@ class FIRResBlock(nn.Module):
         x_size: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
         """
-        Forward pass.
+        Forward pass with sequential Swin → SFB flow.
         
         Args:
             x: Input tensor of shape [B, C, H, W]
@@ -385,29 +392,22 @@ class FIRResBlock(nn.Module):
         """
         B, C, H, W = x.shape
         
-        # Skip connection
-        skip = self.skip(x)
+        # === Skip connection (identity or channel projection) ===
+        identity = self.skip(x)
         
-        # First conv
+        # === Stage 1: Conv + FiLM (radius conditioning BEFORE attention) ===
         h = self.norm1(x)
         h = F.silu(h)
         h = self.conv1(h)
         
-        # Radius conditioning via FiLM
-        # r_emb: [B, radius_emb_dim] -> [B, out_channels * 2]
+        # FiLM modulation: inject noise level information
         r_cond = self.radius_proj(r_emb)
         scale, shift = r_cond.chunk(2, dim=-1)
         scale = scale[:, :, None, None]  # [B, C, 1, 1]
         shift = shift[:, :, None, None]
         h = h * (1 + scale) + shift
         
-        # Second conv
-        h = self.norm2(h)
-        h = F.silu(h)
-        h = self.dropout(h)
-        h = self.conv2(h)
-        
-        # Optional Swin attention
+        # === Stage 2: Swin Attention (sequential) ===
         if self.swin_blocks is not None:
             # Reshape for Swin: [B, C, H, W] -> [B, H*W, C]
             h_flat = h.flatten(2).transpose(1, 2)
@@ -419,8 +419,13 @@ class FIRResBlock(nn.Module):
             # Reshape back: [B, H*W, C] -> [B, C, H, W]
             h = h_flat.transpose(1, 2).view(B, -1, H, W)
         
-        # Residual with SFB (global features) - scaled for stability
-        return self.residual_scale * (self.residual(skip) + h)
+        # === Stage 3: SFB Blocks (sequential, AFTER Swin) ===
+        if self.sfb_blocks is not None:
+            for sfb_block in self.sfb_blocks:
+                h = sfb_block(h)
+        
+        # === Residual connection: processed + identity ===
+        return self.residual_scale * (h + identity)
 
 
 class Downsample(nn.Module):

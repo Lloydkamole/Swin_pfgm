@@ -48,17 +48,24 @@ class SwinFIRUNet(nn.Module):
     Combines SwinFIR attention and SFB blocks with UNet architecture
     for MRI-to-CT synthesis with PFGM++ training.
     
+    Sequential Architecture (following SwinFIR design):
+    Each FIRResBlock follows: conv+FiLM → Swin blocks → SFB blocks → residual
+    
     Args:
         in_channels: Number of input channels (2: noisy_CT + MRI condition).
         out_channels: Number of output channels (1: predicted vector field).
         base_channels: Base channel dimension (multiplied at each stage).
         channel_mults: Channel multipliers for each stage.
-        num_res_blocks: Number of residual blocks per stage.
+        num_res_blocks: Number of residual blocks per stage (controls how many
+            times the Swin+SFB residual block repeats at each encoder/decoder stage).
         radius_emb_dim: Dimension of radius embedding.
         attention_resolutions: Resolutions (relative to base) where attention is applied.
         num_heads: Number of attention heads.
         window_size: Window size for Swin attention.
         mlp_ratio: MLP expansion ratio in Swin blocks.
+        num_swin_blocks: Number of Swin attention blocks per FIRResBlock.
+        num_sfb_blocks: Number of SFB blocks per FIRResBlock.
+        num_bottleneck_blocks: Number of residual blocks in the bottleneck.
         use_sfb: Whether to use SFB (Spatial-Frequency Block).
         dropout: Dropout rate.
         drop_path_rate: Stochastic depth rate.
@@ -76,6 +83,9 @@ class SwinFIRUNet(nn.Module):
         num_heads: int = 8,
         window_size: int = 8,
         mlp_ratio: float = 4.0,
+        num_swin_blocks: int = 2,
+        num_sfb_blocks: int = 1,
+        num_bottleneck_blocks: int = 2,
         use_sfb: bool = True,
         dropout: float = 0.0,
         drop_path_rate: float = 0.1,
@@ -88,6 +98,8 @@ class SwinFIRUNet(nn.Module):
         self.channel_mults = channel_mults
         self.num_res_blocks = num_res_blocks
         self.window_size = window_size
+        self.num_sfb_blocks = num_sfb_blocks
+        self.num_bottleneck_blocks = num_bottleneck_blocks
         
         # Calculate stochastic depth rates
         num_stages = len(channel_mults)
@@ -127,6 +139,8 @@ class SwinFIRUNet(nn.Module):
                         num_heads=num_heads,
                         window_size=window_size,
                         mlp_ratio=mlp_ratio,
+                        num_swin_blocks=num_swin_blocks,
+                        num_sfb_blocks=num_sfb_blocks,
                         drop_path=dpr[block_idx],
                         dropout=dropout,
                     )
@@ -140,7 +154,7 @@ class SwinFIRUNet(nn.Module):
             if i < num_stages - 1:
                 self.downsamples.append(Downsample(current_channels))
         
-        # Bottleneck
+        # Bottleneck (configurable number of blocks)
         self.bottleneck = nn.ModuleList([
             FIRResBlock(
                 in_channels=current_channels,
@@ -151,21 +165,12 @@ class SwinFIRUNet(nn.Module):
                 num_heads=num_heads,
                 window_size=window_size,
                 mlp_ratio=mlp_ratio,
+                num_swin_blocks=num_swin_blocks,
+                num_sfb_blocks=num_sfb_blocks,
                 drop_path=drop_path_rate,
                 dropout=dropout,
-            ),
-            FIRResBlock(
-                in_channels=current_channels,
-                out_channels=current_channels,
-                radius_emb_dim=radius_emb_dim,
-                use_swin=True,
-                use_sfb=use_sfb,
-                num_heads=num_heads,
-                window_size=window_size,
-                mlp_ratio=mlp_ratio,
-                drop_path=drop_path_rate,
-                dropout=dropout,
-            ),
+            )
+            for _ in range(num_bottleneck_blocks)
         ])
         
         # Decoder (reverse order)
@@ -201,6 +206,8 @@ class SwinFIRUNet(nn.Module):
                         num_heads=num_heads,
                         window_size=window_size,
                         mlp_ratio=mlp_ratio,
+                        num_swin_blocks=num_swin_blocks,
+                        num_sfb_blocks=num_sfb_blocks,
                         drop_path=dpr[block_idx % len(dpr)],
                         dropout=dropout,
                     )

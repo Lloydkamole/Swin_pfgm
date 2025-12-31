@@ -333,8 +333,8 @@ class SwinTransformerBlock(nn.Module):
         mask_windows = window_partition(img_mask, self.window_size)
         mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0))
-        attn_mask = attn_mask.masked_fill(attn_mask == 0, float(0.0))
+        # Use -1e4 instead of -100 for better numerical stability with softmax
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-1e5))
         
         return attn_mask
     

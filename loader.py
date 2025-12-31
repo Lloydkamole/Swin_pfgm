@@ -49,9 +49,9 @@ def get_monai_nifti_transforms(mode="train", target_size=256):
     if mode == "train":
         # Add augmentation for training
         transforms = base_transforms + [
-            #RandFlipd(keys=keys, prob=0.5, spatial_axis=1),  # Flip H
-            #RandFlipd(keys=keys, prob=0.5, spatial_axis=2),  # Flip W
-            #RandRotate90d(keys=keys, prob=0.5, spatial_axes=(1, 2)),
+            RandFlipd(keys=keys, prob=0.5, spatial_axis=0),  # Flip H
+            RandFlipd(keys=keys, prob=0.5, spatial_axis=1),  # Flip W
+            #RandRotate90d(keys=keys, prob=0.5, spatial_axes=(0, 1)),
         ]
     else:
         transforms = base_transforms

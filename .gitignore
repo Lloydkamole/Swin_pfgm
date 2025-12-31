@@ -2,6 +2,11 @@
 /outputs/
 /outputs_accelerate/
 /outputs_accelerate_v2/
+/outputs_mp_accelerate/
+/outputs_accelerate_25d/
+/divers/
+/evaluation_results/
+/docs/
 
 # Python
 *.py[cod]
@@ -21,3 +26,5 @@ ENV/
 
 # OS
 .DS_Store
+
+

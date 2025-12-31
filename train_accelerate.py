@@ -65,7 +65,7 @@ except Exception:
 
 config = {
     # Data Settings
-    "data_dir": "/home/lloyd/Documents/AR PFGM/train_pfgm",
+    "data_dir": "/home/lloyd/Documents/AR PFGM/pfgm_train",
     "mr_pattern": "mr.nii", # Suffix pattern to match MRI files
     "ct_pattern": "ct.nii", # Suffix pattern to match CT files
     "train_split": 0.9,
@@ -73,17 +73,20 @@ config = {
     
     # Model Architecture
     "model_config": "custom", # "custom" or predefined config name
-    "base_channels": 64,   
-    "channel_mults": [1, 2, 4],
-    "num_res_blocks": 2,
-    "attention_resolutions": [2, 4],  # Downsample factors for attention
+    "base_channels": 128,   # Reduced from 128 for memory
+    "channel_mults": [1, 2, 4, 8],
+    "num_res_blocks": 2,  # Number of times the Swin+SFB block repeats per encoder/decoder stage
+    "attention_resolutions": [],  # Reduced: only use attention at lower resolutions
     "num_heads": 4,
     "mlp_ratio": 4.0, # MLP expansion ratio in transformer blocks
     "radius_emb_dim": 256,
-    "window_size": 4, # Swin Transformer window size
-    "use_sfb": True,  # Use Shifted-Fixed Blocks
-    "dropout": 0.0,
-    "drop_path": 0.1,
+    "window_size": 8, # Swin Transformer window size
+    "num_swin_blocks": 2,  # Number of Swin attention blocks per FIRResBlock (W-MSA + SW-MSA pattern)
+    "num_sfb_blocks": 1,   # Number of SFB blocks per FIRResBlock (sequential after Swin)
+    "num_bottleneck_blocks": 4,  # Number of residual blocks in the bottleneck
+    "use_sfb": True,  # Use Spatial-Frequency Blocks
+    "dropout": 0.05,
+    "drop_path": 0.05,
     
     # EDM Parameters
     "sigma_min": 0.002,
@@ -94,34 +97,43 @@ config = {
     "rho": 7.0,
     "loss_type": "l2",
     
+    # PFGM++ Parameters
+    "pfgmpp": True,                      # Enable PFGM++ mode (vs pure EDM)
+    "D": 128,                            # Augmented dimension for PFGM++ (D→∞ recovers EDM)
+      
     # Classifier-Free Guidance (CFG)
-    "cond_drop_prob": 0.0,               # Probability of dropping MRI conditioning (0.0 = no CFG)
-    "cfg_scale": 3.0,                    # Guidance scale at inference (1.0 = no guidance)
+    "cond_drop_prob": 0.2,               # Probability of dropping MRI conditioning (0.0 = no CFG)
+    "cfg_scale": 2.0,                    # Guidance scale at inference (1.0 = no guidance)
+    
+    # Masked Loss (Anatomical Focusing)
+    "use_masked_loss": False,             # Enable masked loss (body-only)
+    "masked_loss_ratio": 0,            # Ratio of samples using masked loss (0.0-1.0) 
+    "mask_threshold": -0.7,              # Threshold for body mask in normalized [-1,1] range
     
     # Training Parameters
-    "num_epochs": 100,
-    "batch_size": 5,  # Per GPU batch size (reduced for multi-GPU memory)
+    "num_epochs": 150,
+    "batch_size": 3,  # Per GPU batch size (reduced for memory)
     "lr": 1e-4,
     "weight_decay": 0.01,
-    "grad_clip": None,
-    "warmup_steps": 500,
+    "grad_clip": None,  # Enable gradient clipping
+    "warmup_steps": 200,
     
     # Sampling / Generation
     "num_sample_steps": 50,
-    "num_val_samples": 4,
+    "num_val_samples": 3,
     
     # Logging & Checkpointing
     "output_dir": "./outputs_accelerate",
     "log_every": 5,
     "val_every": 1,
-    "save_every": 5,
+    "save_every": 10,
     "sample_every": 1,
     "resume": None,
     
     # Gradient & ODE Monitoring
     "log_gradients": True,
     "log_ode_trajectory": True,
-    "grad_log_interval": 100,
+    "grad_log_interval": 150,
     
     # System
     "seed": 42,
@@ -225,6 +237,166 @@ def sample_sigma(
     return sigma
 
 
+# =============================================================================
+# PFGM++ Functions
+# =============================================================================
+
+def pfgmpp_perturbation(
+    images: torch.Tensor,
+    sigma: torch.Tensor,
+    D: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply PFGM++ perturbation using inverse-beta (beta-prime) distribution.
+    
+    This implements the augmented-space perturbation from PFGM++ paper:
+    - r = sigma * sqrt(D)  (transfer formula)
+    - Sample radius R from inverse-beta distribution
+    - Perturb in N-dimensional data space with uniform direction on N-sphere
+    
+    Args:
+        images: Clean images [B, C, H, W]
+        sigma: Noise levels [B]
+        D: Augmented dimension (D→∞ recovers Gaussian diffusion)
+    
+    Returns:
+        perturbed_images: Images with PFGM++ noise [B, C, H, W]
+        used_sigmas: The sigma values used (for embedding)
+    """
+    B = images.shape[0]
+    N = images[0].numel()  # Data dimension (C*H*W)
+    device = images.device
+    
+    # r = sigma * sqrt(D) - the PFGM++ transfer formula
+    r = sigma.double() * np.sqrt(D)
+    
+    # Sample from inverse-beta (beta-prime) distribution
+    # Beta(N/2, D/2) then inverse_beta = beta / (1 - beta)
+    samples_norm = np.random.beta(a=N / 2., b=D / 2., size=B).astype(np.float64)
+    samples_norm = torch.from_numpy(samples_norm).to(device)
+    inverse_beta = samples_norm / (1 - samples_norm + 1e-8)
+    
+    # Radius = r * sqrt(inverse_beta)
+    radius = r * torch.sqrt(inverse_beta + 1e-8)
+    
+    # Sample uniform direction on N-sphere via normalized Gaussian
+    gaussian = torch.randn(B, N, device=device, dtype=torch.float64)
+    unit_gaussian = gaussian / (torch.norm(gaussian, p=2, dim=1, keepdim=True) + 1e-8)
+    
+    # Perturbation = unit_direction * radius
+    perturbation = unit_gaussian * radius.view(B, 1)
+    
+    # Reshape back to image shape and add to clean images
+    perturbation = perturbation.view_as(images).float()
+    perturbed_images = images + perturbation
+    
+    return perturbed_images, sigma
+
+
+def pfgmpp_target(
+    perturbed_images: torch.Tensor,
+    clean_images: torch.Tensor,
+    sigma: torch.Tensor,
+    D: int = 128,
+) -> torch.Tensor:
+    """
+    Compute PFGM++ Poisson field target.
+    
+    The target is the normalized direction from perturbed to clean,
+    scaled by the augmented-space geometry.
+    
+    For PFGM++, the network predicts the Poisson field direction,
+    which points from the noisy sample toward the data manifold.
+    
+    Args:
+        perturbed_images: Noisy images [B, C, H, W]
+        clean_images: Clean target images [B, C, H, W]
+        sigma: Noise levels [B]
+        D: Augmented dimension
+    
+    Returns:
+        target: PFGM++ target for the network [B, C, H, W]
+    """
+    B = perturbed_images.shape[0]
+    N = perturbed_images[0].numel()
+    device = perturbed_images.device
+    
+    # r = sigma * sqrt(D)
+    r = sigma.view(-1, 1, 1, 1) * np.sqrt(D)
+    
+    # Difference vector (perturbed - clean) in data space
+    diff = perturbed_images - clean_images
+    
+    # Compute the norm of the difference
+    diff_flat = diff.view(B, -1)
+    diff_norm = torch.norm(diff_flat, p=2, dim=1, keepdim=True).view(B, 1, 1, 1)
+    
+    # PFGM++ target: direction scaled by geometry
+    # The target points from perturbed back to clean, normalized
+    # With augmented dimension factor
+    norm_sq = diff_norm ** 2 + r ** 2
+    
+    # Target is the clean image (denoising target), same as EDM
+    # but the loss weighting differs
+    target = clean_images
+    
+    return target
+
+
+def pfgmpp_sample_prior(
+    batch_size: int,
+    channels: int,
+    height: int,
+    width: int,
+    sigma_max: float,
+    D: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float64,
+) -> torch.Tensor:
+    """
+    Sample from PFGM++ prior distribution for sampling initialization.
+    
+    Instead of Gaussian N(0, sigma_max^2), PFGM++ uses:
+    - Radius from inverse-beta distribution
+    - Direction uniform on N-sphere
+    
+    Args:
+        batch_size: Number of samples
+        channels, height, width: Image dimensions
+        sigma_max: Maximum sigma (converted to r_max = sigma_max * sqrt(D))
+        D: Augmented dimension
+        device: Target device
+        dtype: Target dtype
+    
+    Returns:
+        Initial latents for sampling [B, C, H, W]
+    """
+    N = channels * height * width  # Data dimension
+    
+    # r_max = sigma_max * sqrt(D)
+    r_max = sigma_max * np.sqrt(D)
+    
+    # Sample from inverse-beta distribution
+    samples_norm = np.random.beta(a=N / 2., b=D / 2., size=batch_size).astype(np.float64)
+    samples_norm = torch.from_numpy(samples_norm).to(device)
+    inverse_beta = samples_norm / (1 - samples_norm + 1e-8)
+    
+    # Radius = r_max * sqrt(inverse_beta)
+    radius = r_max * torch.sqrt(inverse_beta + 1e-8)
+    
+    # Sample uniform direction on N-sphere
+    gaussian = torch.randn(batch_size, N, device=device, dtype=torch.float64)
+    unit_gaussian = gaussian / (torch.norm(gaussian, p=2, dim=1, keepdim=True) + 1e-8)
+    
+    # Initial latent = unit_direction * radius
+    latent = unit_gaussian * radius.view(batch_size, 1)
+    
+    # Reshape to image
+    latent = latent.view(batch_size, channels, height, width).to(dtype)
+    
+    return latent
+
+
 def edm_loss(
     model: nn.Module,
     x_clean: torch.Tensor,
@@ -233,20 +405,34 @@ def edm_loss(
     sigma_data: float = 0.5,
     loss_type: str = 'l2',
     cond_drop_prob: float = 0.0,
+    use_masked_loss: bool = False,
+    masked_loss_ratio: float = 0.6,
+    mask_threshold: float = -0.7,
+    pfgmpp: bool = False,
+    D: int = 128,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    Compute EDM-style loss with optional classifier-free guidance training.
+    Compute EDM/PFGM++ loss with optional classifier-free guidance training and masked loss.
     
     Args:
         cond_drop_prob: Probability of dropping MRI conditioning (replacing with zeros).
                         Set to 0.0 to disable CFG training.
+        use_masked_loss: If True, apply body masking to focus loss on anatomy.
+        masked_loss_ratio: Probability of using masked loss (0.0-1.0).
+        mask_threshold: Threshold for body mask (pixels > threshold are body).
+        pfgmpp: If True, use PFGM++ perturbation (inverse-beta) instead of Gaussian.
+        D: Augmented dimension for PFGM++ (D→∞ recovers EDM/Gaussian).
     
     Returns:
         loss: Scalar loss value
         metrics: Dictionary of metrics for logging
     """
-    n = torch.randn_like(x_clean) * sigma.view(-1, 1, 1, 1)
-    x_noisy = x_clean + n
+    # Apply perturbation: PFGM++ (inverse-beta) or EDM (Gaussian)
+    if pfgmpp:
+        x_noisy, sigma = pfgmpp_perturbation(x_clean, sigma, D=D)
+    else:
+        n = torch.randn_like(x_clean) * sigma.view(-1, 1, 1, 1)
+        x_noisy = x_clean + n
     
     # Classifier-free guidance: randomly drop conditioning
     if cond_drop_prob > 0.0 and model.training:
@@ -261,6 +447,18 @@ def edm_loss(
     sigma_v = sigma.view(-1, 1, 1, 1)
     weight = (sigma_v ** 2 + sigma_data ** 2) / ((sigma_v * sigma_data) ** 2)
     weight = weight.clamp(max=100.0)
+    
+    # Generate body mask if using masked loss
+    body_mask = None
+    use_mask_this_batch = False
+    if use_masked_loss and model.training:
+        # Randomly decide whether to use masking for this batch
+        if torch.rand(1).item() < masked_loss_ratio:
+            use_mask_this_batch = True
+            # Generate mask from CT (body = pixels > threshold)
+            body_mask = (x_clean > mask_threshold).float()
+            # Combine with weight
+            weight = weight * body_mask
     
     if loss_type == 'l1':
         loss = (weight * (D_x - x_clean).abs()).mean()
@@ -286,6 +484,14 @@ def edm_loss(
         'sigma_min': sigma.min().item(),
     }
     
+    # Add mask statistics if used
+    if use_mask_this_batch and body_mask is not None:
+        mask_ratio = body_mask.mean().item()
+        metrics['mask_ratio'] = mask_ratio
+        metrics['masked'] = 1.0
+    else:
+        metrics['masked'] = 0.0
+    
     return loss, metrics
 
 
@@ -304,16 +510,21 @@ def edm_sample(
     S_noise: float = 1.0,
     return_trajectory_stats: bool = False,
     cfg_scale: float = 1.0,
+    pfgmpp: bool = False,
+    D: int = 128,
 ) -> torch.Tensor:
     """
-    Generate CT images from MRI using EDM sampling (Algorithm 2 from EDM paper).
+    Generate CT images from MRI using EDM/PFGM++ sampling.
     
     This is a deterministic ODE sampler with optional stochasticity.
+    When pfgmpp=True, uses PFGM++ prior (inverse-beta) for initialization.
     
     Args:
         return_trajectory_stats: If True, returns (samples, stats_dict) with ODE trajectory info
         cfg_scale: Classifier-free guidance scale. 1.0 = no guidance, >1.0 = stronger conditioning.
                    Requires model trained with cond_drop_prob > 0.
+        pfgmpp: If True, use PFGM++ prior (inverse-beta) instead of Gaussian.
+        D: Augmented dimension for PFGM++.
     """
     B, C, H, W = mri.shape
     device = mri.device
@@ -322,7 +533,20 @@ def edm_sample(
     t_steps = (sigma_max ** (1/rho) + step_indices / (num_steps - 1) * (sigma_min ** (1/rho) - sigma_max ** (1/rho))) ** rho
     t_steps = torch.cat([t_steps, torch.zeros_like(t_steps[:1])])
     
-    x_next = torch.randn(B, 1, H, W, device=device, dtype=torch.float64) * t_steps[0]
+    # Initialize latents: PFGM++ prior or Gaussian
+    if pfgmpp:
+        x_next = pfgmpp_sample_prior(
+            batch_size=B,
+            channels=1,  # CT output channels
+            height=H,
+            width=W,
+            sigma_max=sigma_max,
+            D=D,
+            device=device,
+            dtype=torch.float64,
+        )
+    else:
+        x_next = torch.randn(B, 1, H, W, device=device, dtype=torch.float64) * t_steps[0]
     
     # Track ODE trajectory statistics
     traj_norms = [x_next.norm().item()]
@@ -448,6 +672,9 @@ def train(cfg: dict):
             mlp_ratio=cfg["mlp_ratio"],
             radius_emb_dim=cfg["radius_emb_dim"],
             window_size=cfg["window_size"],
+            num_swin_blocks=cfg["num_swin_blocks"],
+            num_sfb_blocks=cfg["num_sfb_blocks"],
+            num_bottleneck_blocks=cfg["num_bottleneck_blocks"],
             use_sfb=cfg["use_sfb"],
             dropout=cfg["dropout"],
             drop_path_rate=cfg["drop_path"],
@@ -654,6 +881,11 @@ def train(cfg: dict):
                     sigma_data=cfg["sigma_data"],
                     loss_type=cfg["loss_type"],
                     cond_drop_prob=cfg.get("cond_drop_prob", 0.0),
+                    use_masked_loss=cfg.get("use_masked_loss", False),
+                    masked_loss_ratio=cfg.get("masked_loss_ratio", 0.6),
+                    mask_threshold=cfg.get("mask_threshold", -0.7),
+                    pfgmpp=cfg.get("pfgmpp", False),
+                    D=cfg.get("D", 128),
                 )
                 
                 accelerator.backward(loss)
@@ -674,7 +906,7 @@ def train(cfg: dict):
             })
             
             if batch_idx % cfg["log_every"] == 0:
-                accelerator.log({
+                log_dict = {
                     "train/loss": loss.item(),
                     "train/mse": metrics['mse'],
                     "train/pred_std": metrics['pred_std'],
@@ -683,7 +915,13 @@ def train(cfg: dict):
                     "train/sigma_mean": metrics['sigma_mean'],
                     "train/sigma_max": metrics['sigma_max'],
                     "train/sigma_min": metrics['sigma_min'],
-                }, step=global_step)
+                    "train/masked": metrics['masked'],
+                }
+                # Add mask ratio if masking was used
+                if 'mask_ratio' in metrics:
+                    log_dict["train/mask_ratio"] = metrics['mask_ratio']
+                
+                accelerator.log(log_dict, step=global_step)
             
             # Check gradient flow periodically
             if cfg.get("log_gradients", False) and batch_idx % cfg.get("grad_log_interval", 100) == 0:
@@ -721,77 +959,86 @@ def train(cfg: dict):
             print(f"\nEpoch {epoch+1}: avg_loss={avg_loss:.3e}, time={epoch_time:.1f}s")
         
         # Sample generation
-        if (epoch + 1) % cfg["sample_every"] == 0 and accelerator.is_main_process:
+        if (epoch + 1) % cfg["sample_every"] == 0:
             model.eval()
-            with torch.no_grad():
-                sample_batch = next(iter(train_loader))
-                mr_samples = sample_batch["mr"][:cfg["num_val_samples"]]
-                ct_samples = sample_batch["ct"][:cfg["num_val_samples"]]
+            
+            # All ranks must participate in DataLoader iteration to avoid NCCL timeout
+            sample_batch = next(iter(train_loader))
+            mr_samples = sample_batch["mr"][:cfg["num_val_samples"]]
+            ct_samples = sample_batch["ct"][:cfg["num_val_samples"]]
+            
+            # Only main process does generation and logging
+            if accelerator.is_main_process:
+                with torch.no_grad():
                 
-                # Get unwrapped model for sampling
-                unwrapped_model = accelerator.unwrap_model(model)
-                # Sample with optional ODE trajectory logging
-                if cfg.get("log_ode_trajectory", False):
-                    pred_ct, ode_stats = edm_sample(
-                        unwrapped_model, mr_samples,
-                        num_steps=cfg["num_sample_steps"],
-                        sigma_min=cfg["sigma_min"],
-                        sigma_max=cfg["sigma_max"],
-                        sigma_data=cfg["sigma_data"],
-                        rho=cfg["rho"],
-                        return_trajectory_stats=True,
-                        cfg_scale=cfg.get("cfg_scale", 1.0),
-                    )
-                    # Log ODE trajectory stats
-                    accelerator.log({
-                        "ode/initial_norm": ode_stats['initial_norm'],
-                        "ode/final_norm": ode_stats['final_norm'],
-                        "ode/mean_denoised_norm": ode_stats['mean_denoised_norm'],
-                        "ode/mean_score_norm": ode_stats['mean_score_norm'],
-                        "ode/mean_update_norm": ode_stats['mean_update_norm'],
-                    }, step=epoch)
-                else:
-                    pred_ct = edm_sample(
-                        unwrapped_model, mr_samples,
-                        num_steps=cfg["num_sample_steps"],
-                        sigma_min=cfg["sigma_min"],
-                        sigma_max=cfg["sigma_max"],
-                        sigma_data=cfg["sigma_data"],
-                        rho=cfg["rho"],
-                        cfg_scale=cfg.get("cfg_scale", 1.0),
-                    )
-                
-                pred_ct = torch.clamp(pred_ct, -1.0, 1.0)
-                pred_ct_01 = (pred_ct + 1.0) / 2.0
-                ct_samples_01 = (ct_samples + 1.0) / 2.0
-                
-                if psnr_metric is not None:
-                    psnr_val = psnr_metric(pred_ct_01, ct_samples_01)
-                    ssim_val = ssim_metric(pred_ct_01, ct_samples_01)
-                    mae_val = mae_metric(pred_ct_01, ct_samples_01) if mae_metric else None
+                    # Get unwrapped model for sampling
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    # Sample with optional ODE trajectory logging
+                    if cfg.get("log_ode_trajectory", False):
+                        pred_ct, ode_stats = edm_sample(
+                            unwrapped_model, mr_samples,
+                            num_steps=cfg["num_sample_steps"],
+                            sigma_min=cfg["sigma_min"],
+                            sigma_max=cfg["sigma_max"],
+                            sigma_data=cfg["sigma_data"],
+                            rho=cfg["rho"],
+                            return_trajectory_stats=True,
+                            cfg_scale=cfg.get("cfg_scale", 1.0),
+                            pfgmpp=cfg.get("pfgmpp", False),
+                            D=cfg.get("D", 128),
+                        )
+                        # Log ODE trajectory stats
+                        accelerator.log({
+                            "ode/initial_norm": ode_stats['initial_norm'],
+                            "ode/final_norm": ode_stats['final_norm'],
+                            "ode/mean_denoised_norm": ode_stats['mean_denoised_norm'],
+                            "ode/mean_score_norm": ode_stats['mean_score_norm'],
+                            "ode/mean_update_norm": ode_stats['mean_update_norm'],
+                        }, step=epoch)
+                    else:
+                        pred_ct = edm_sample(
+                            unwrapped_model, mr_samples,
+                            num_steps=cfg["num_sample_steps"],
+                            sigma_min=cfg["sigma_min"],
+                            sigma_max=cfg["sigma_max"],
+                            sigma_data=cfg["sigma_data"],
+                            rho=cfg["rho"],
+                            cfg_scale=cfg.get("cfg_scale", 1.0),
+                            pfgmpp=cfg.get("pfgmpp", False),
+                            D=cfg.get("D", 128),
+                        )
                     
-                    log_dict = {
-                        "gen/psnr": psnr_val.item(),
-                        "gen/ssim": ssim_val.item(),
-                    }
-                    if mae_val is not None:
-                        log_dict["gen/mae"] = mae_val.item()
+                    pred_ct = torch.clamp(pred_ct, -1.0, 1.0)
+                    pred_ct_01 = (pred_ct + 1.0) / 2.0
+                    ct_samples_01 = (ct_samples + 1.0) / 2.0
                     
-                    accelerator.log(log_dict, step=epoch)
-                    mae_str = f", MAE={mae_val:.5f}" if mae_val else ""
-                    print(f"  Generation: PSNR={psnr_val:.3f}, SSIM={ssim_val:.5f}{mae_str}")
-                
-                # Log training sample images to TensorBoard
-                img_grid = vutils.make_grid(
-                    torch.cat([mr_samples.cpu(), pred_ct.cpu(), ct_samples.cpu()], dim=0),
-                    nrow=cfg["num_val_samples"],
-                    normalize=True,
-                    scale_each=True
-                )
-                # Get TensorBoard writer from Accelerate tracker
-                tb_tracker = accelerator.get_tracker("tensorboard")
-                if tb_tracker is not None:
-                    tb_tracker.writer.add_image("Gen/MRI_Pred_GT", img_grid, epoch)
+                    if psnr_metric is not None:
+                        psnr_val = psnr_metric(pred_ct_01, ct_samples_01)
+                        ssim_val = ssim_metric(pred_ct_01, ct_samples_01)
+                        mae_val = mae_metric(pred_ct_01, ct_samples_01) if mae_metric else None
+                        
+                        log_dict = {
+                            "gen/psnr": psnr_val.item(),
+                            "gen/ssim": ssim_val.item(),
+                        }
+                        if mae_val is not None:
+                            log_dict["gen/mae"] = mae_val.item()
+                        
+                        accelerator.log(log_dict, step=epoch)
+                        mae_str = f", MAE={mae_val:.5f}" if mae_val else ""
+                        print(f"  Generation: PSNR={psnr_val:.3f}, SSIM={ssim_val:.5f}{mae_str}")
+                    
+                    # Log training sample images to TensorBoard
+                    img_grid = vutils.make_grid(
+                        torch.cat([mr_samples.cpu(), pred_ct.cpu(), ct_samples.cpu()], dim=0),
+                        nrow=cfg["num_val_samples"],
+                        normalize=True,
+                        scale_each=True
+                    )
+                    # Get TensorBoard writer from Accelerate tracker
+                    tb_tracker = accelerator.get_tracker("tensorboard")
+                    if tb_tracker is not None:
+                        tb_tracker.writer.add_image("Gen/MRI_Pred_GT", img_grid, epoch)
             model.train()
         
         # Validation
@@ -817,7 +1064,9 @@ def train(cfg: dict):
                     loss, _ = edm_loss(
                         model, ct, mr, sigma,
                         sigma_data=cfg["sigma_data"],
-                        loss_type=cfg["loss_type"]
+                        loss_type=cfg["loss_type"],
+                        pfgmpp=cfg.get("pfgmpp", False),
+                        D=cfg.get("D", 128),
                     )
                     val_loss_accum += loss.item()
                     val_batches += 1
@@ -834,13 +1083,14 @@ def train(cfg: dict):
                 if accelerator.is_main_process:
                     print(f"  New best model saved!")
             
-            # Validation sample generation (on main process only)
+            # Validation sample generation
+            # All ranks must participate in DataLoader iteration to avoid NCCL timeout
+            val_sample_batch = next(iter(val_loader))
+            mr_val_samples = val_sample_batch["mr"][:cfg["num_val_samples"]]
+            ct_val_samples = val_sample_batch["ct"][:cfg["num_val_samples"]]
+            
+            # Only main process does generation and logging
             if accelerator.is_main_process and psnr_metric is not None:
-                # Get a batch from validation loader for generation
-                val_sample_batch = next(iter(val_loader))
-                mr_val_samples = val_sample_batch["mr"][:cfg["num_val_samples"]]
-                ct_val_samples = val_sample_batch["ct"][:cfg["num_val_samples"]]
-                
                 unwrapped_model = accelerator.unwrap_model(model)
                 
                 # Generate samples from validation MRI
@@ -852,6 +1102,8 @@ def train(cfg: dict):
                     sigma_data=cfg["sigma_data"],
                     rho=cfg["rho"],
                     cfg_scale=cfg.get("cfg_scale", 1.0),
+                    pfgmpp=cfg.get("pfgmpp", False),
+                    D=cfg.get("D", 128),
                 )
                 
                 pred_val_ct = torch.clamp(pred_val_ct, -1.0, 1.0)
