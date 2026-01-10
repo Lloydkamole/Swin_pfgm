@@ -65,7 +65,7 @@ except Exception:
 
 config = {
     # Data Settings
-    "data_dir": "/home/lloyd/Documents/AR PFGM/pfgm_train",
+    "data_dir": "/home/lloyd/Documents/AR PFGM/pfgm_train_brain",
     "mr_pattern": "mr.nii", # Suffix pattern to match MRI files
     "ct_pattern": "ct.nii", # Suffix pattern to match CT files
     "train_split": 0.9,
@@ -73,25 +73,25 @@ config = {
     
     # Model Architecture
     "model_config": "custom", # "custom" or predefined config name
-    "base_channels": 128,   # Reduced from 128 for memory
+    "base_channels": 64,   # Reduced from 128 for memory
     "channel_mults": [1, 2, 4, 8],
-    "num_res_blocks": 2,  # Number of times the Swin+SFB block repeats per encoder/decoder stage
+    "num_res_blocks": 1,  # Number of times the Swin+SFB block repeats per encoder/decoder stage
     "attention_resolutions": [],  # Reduced: only use attention at lower resolutions
-    "num_heads": 4,
+    "num_heads": 8,
     "mlp_ratio": 4.0, # MLP expansion ratio in transformer blocks
     "radius_emb_dim": 256,
-    "window_size": 8, # Swin Transformer window size
-    "num_swin_blocks": 2,  # Number of Swin attention blocks per FIRResBlock (W-MSA + SW-MSA pattern)
+    "window_size": 4, # Swin Transformer window size
+    "num_swin_blocks": 4,  # Number of Swin attention blocks per FIRResBlock (W-MSA + SW-MSA pattern)
     "num_sfb_blocks": 1,   # Number of SFB blocks per FIRResBlock (sequential after Swin)
     "num_bottleneck_blocks": 4,  # Number of residual blocks in the bottleneck
     "use_sfb": True,  # Use Spatial-Frequency Blocks
-    "dropout": 0.05,
-    "drop_path": 0.05,
+    "dropout": 0.0,
+    "drop_path": 0.0,
     
     # EDM Parameters
     "sigma_min": 0.002,
     "sigma_max": 80.0,
-    "sigma_data": 0.5,
+    "sigma_data": 1.0, # 0.5 for [-1,1] normalized data, 1.0 for z-normalized
     "P_mean": -1.2,
     "P_std": 1.2,
     "rho": 7.0,
@@ -108,11 +108,16 @@ config = {
     # Masked Loss (Anatomical Focusing)
     "use_masked_loss": False,             # Enable masked loss (body-only)
     "masked_loss_ratio": 0,            # Ratio of samples using masked loss (0.0-1.0) 
-    "mask_threshold": -0.7,              # Threshold for body mask in normalized [-1,1] range
+    "mask_threshold": 0.0,              # Threshold for body mask in z-normalized range (adjust based on data)
+    
+    # Body Mask Training (nnsyn-style anatomically-focused training)
+    "use_body_mask": False,              # Enable body mask loading and masked training
+    "mask_pattern": "mask.nii",          # Suffix pattern to match mask files
+    "mask_outside_value": -1.0,          # Value to use for regions outside the mask in generated images
     
     # Training Parameters
     "num_epochs": 150,
-    "batch_size": 3,  # Per GPU batch size (reduced for memory)
+    "batch_size": 10,  # Per GPU batch size (reduced for memory)
     "lr": 1e-4,
     "weight_decay": 0.01,
     "grad_clip": None,  # Enable gradient clipping
@@ -146,8 +151,9 @@ config = {
 # Utility Functions
 # =============================================================================
 
-def collect_data_files(data_path: str, mr_pattern: str = "mr.nii", ct_pattern: str = "ct.nii"):
-    """Collect MR and CT file pairs from directory structure."""
+def collect_data_files(data_path: str, mr_pattern: str = "mr.nii", ct_pattern: str = "ct.nii", 
+                       mask_pattern: str = "mask.nii", use_body_mask: bool = False):
+    """Collect MR, CT, and optionally mask file pairs from directory structure."""
     data_files = []
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"Data path not found: {data_path}")
@@ -159,14 +165,22 @@ def collect_data_files(data_path: str, mr_pattern: str = "mr.nii", ct_pattern: s
         
         mr_file = None
         ct_file = None
+        mask_file = None
         for filename in os.listdir(patient_path):
             if mr_pattern in filename:
                 mr_file = os.path.join(patient_path, filename)
             if ct_pattern in filename:
                 ct_file = os.path.join(patient_path, filename)
+            if use_body_mask and mask_pattern in filename:
+                mask_file = os.path.join(patient_path, filename)
         
         if mr_file and ct_file:
-            data_files.append({"mr": mr_file, "ct": ct_file, "id": patient_dir})
+            entry = {"mr": mr_file, "ct": ct_file, "id": patient_dir}
+            if use_body_mask:
+                entry["mask"] = mask_file  # Can be None if not found
+                if mask_file is None:
+                    print(f"Warning: No mask found for patient {patient_dir}")
+            data_files.append(entry)
     
     return data_files
 
@@ -410,18 +424,24 @@ def edm_loss(
     mask_threshold: float = -0.7,
     pfgmpp: bool = False,
     D: int = 128,
+    body_mask: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute EDM/PFGM++ loss with optional classifier-free guidance training and masked loss.
     
+    Supports two masking modes:
+    1. Threshold-based: Generate mask from CT (old method, use_masked_loss=True, body_mask=None)
+    2. Body mask: Use explicit body contour mask from dataloader (body_mask not None)
+    
     Args:
         cond_drop_prob: Probability of dropping MRI conditioning (replacing with zeros).
                         Set to 0.0 to disable CFG training.
-        use_masked_loss: If True, apply body masking to focus loss on anatomy.
-        masked_loss_ratio: Probability of using masked loss (0.0-1.0).
+        use_masked_loss: If True, apply body masking to focus loss on anatomy (threshold-based).
+        masked_loss_ratio: Probability of using masked loss (0.0-1.0) for threshold mode.
         mask_threshold: Threshold for body mask (pixels > threshold are body).
         pfgmpp: If True, use PFGM++ perturbation (inverse-beta) instead of Gaussian.
         D: Augmented dimension for PFGM++ (D→∞ recovers EDM/Gaussian).
+        body_mask: Optional explicit body mask [B, 1, H, W] from dataloader (nnsyn-style).
     
     Returns:
         loss: Scalar loss value
@@ -448,17 +468,21 @@ def edm_loss(
     weight = (sigma_v ** 2 + sigma_data ** 2) / ((sigma_v * sigma_data) ** 2)
     weight = weight.clamp(max=100.0)
     
-    # Generate body mask if using masked loss
-    body_mask = None
+    # Apply body mask if provided (nnsyn-style masked training)
+    mask_used = None
     use_mask_this_batch = False
-    if use_masked_loss and model.training:
-        # Randomly decide whether to use masking for this batch
+    
+    if body_mask is not None:
+        # Use explicit body mask from dataloader
+        use_mask_this_batch = True
+        mask_used = body_mask
+        weight = weight * body_mask
+    elif use_masked_loss and model.training:
+        # Fallback: Generate mask from CT threshold (old method)
         if torch.rand(1).item() < masked_loss_ratio:
             use_mask_this_batch = True
-            # Generate mask from CT (body = pixels > threshold)
-            body_mask = (x_clean > mask_threshold).float()
-            # Combine with weight
-            weight = weight * body_mask
+            mask_used = (x_clean > mask_threshold).float()
+            weight = weight * mask_used
     
     if loss_type == 'l1':
         loss = (weight * (D_x - x_clean).abs()).mean()
@@ -471,7 +495,19 @@ def edm_loss(
     
     # Metrics for logging (matching train_pfgm_fir.py)
     with torch.no_grad():
-        mse = F.mse_loss(D_x, x_clean).item()
+        # Compute MSE only on masked region if mask is used
+        if mask_used is not None:
+            # Masked MSE (nnsyn-style)
+            masked_pred = D_x * mask_used
+            masked_target = x_clean * mask_used
+            num_masked_pixels = mask_used.sum()
+            if num_masked_pixels > 0:
+                mse = ((masked_pred - masked_target) ** 2).sum() / num_masked_pixels
+                mse = mse.item()
+            else:
+                mse = F.mse_loss(D_x, x_clean).item()
+        else:
+            mse = F.mse_loss(D_x, x_clean).item()
         pred_std = D_x.std().item()
         target_std = x_clean.std().item()
     
@@ -485,14 +521,81 @@ def edm_loss(
     }
     
     # Add mask statistics if used
-    if use_mask_this_batch and body_mask is not None:
-        mask_ratio = body_mask.mean().item()
+    if use_mask_this_batch and mask_used is not None:
+        mask_ratio = mask_used.mean().item()
         metrics['mask_ratio'] = mask_ratio
         metrics['masked'] = 1.0
     else:
         metrics['masked'] = 0.0
     
     return loss, metrics
+
+
+def compute_masked_metrics(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor = None,
+    psnr_metric=None,
+    ssim_metric=None,
+    mae_metric=None,
+) -> Dict[str, float]:
+    """
+    Compute image quality metrics with optional masking (nnsyn-style).
+    
+    When mask is provided, metrics are computed only on the body region.
+    Outside regions are set to a constant value before computing metrics.
+    
+    Args:
+        pred: Predicted image [B, C, H, W] in [0, 1] range
+        target: Target image [B, C, H, W] in [0, 1] range
+        mask: Binary body mask [B, C, H, W] (1=body, 0=outside)
+        psnr_metric: torchmetrics PSNR object
+        ssim_metric: torchmetrics SSIM object
+        mae_metric: torchmetrics MAE object
+    
+    Returns:
+        Dictionary with psnr, ssim, mae values
+    """
+    metrics = {}
+    
+    if mask is not None:
+        # Apply mask - set outside region to 0 for fair comparison
+        # This follows nnsyn approach where outside is set to constant value
+        pred_masked = pred * mask
+        target_masked = target * mask
+    else:
+        pred_masked = pred
+        target_masked = target
+    
+    if psnr_metric is not None:
+        psnr_val = psnr_metric(pred_masked, target_masked)
+        metrics['psnr'] = psnr_val.item()
+    
+    if ssim_metric is not None:
+        # For SSIM with mask, we follow nnsyn approach
+        if mask is not None:
+            # Set outside to same value to not affect SSIM
+            pred_for_ssim = pred * mask + (1 - mask) * 0.0
+            target_for_ssim = target * mask + (1 - mask) * 0.0
+            ssim_val = ssim_metric(pred_for_ssim, target_for_ssim)
+        else:
+            ssim_val = ssim_metric(pred_masked, target_masked)
+        metrics['ssim'] = ssim_val.item()
+    
+    if mae_metric is not None:
+        if mask is not None:
+            # Compute MAE only on masked region
+            num_masked = mask.sum()
+            if num_masked > 0:
+                mae_val = (pred_masked - target_masked).abs().sum() / num_masked
+                metrics['mae'] = mae_val.item()
+            else:
+                metrics['mae'] = mae_metric(pred, target).item()
+        else:
+            mae_val = mae_metric(pred_masked, target_masked)
+            metrics['mae'] = mae_val.item()
+    
+    return metrics
 
 
 @torch.no_grad()
@@ -717,10 +820,16 @@ def train(cfg: dict):
     if accelerator.is_main_process:
         print("Loading data files...")
     
+    # Determine if using body mask
+    use_body_mask = cfg.get("use_body_mask", False)
+    mask_pattern = cfg.get("mask_pattern", "mask.nii")
+    
     all_files = collect_data_files(
         cfg["data_dir"],
         mr_pattern=cfg["mr_pattern"],
-        ct_pattern=cfg["ct_pattern"]
+        ct_pattern=cfg["ct_pattern"],
+        mask_pattern=mask_pattern,
+        use_body_mask=use_body_mask,
     )
     
     random.shuffle(all_files)
@@ -730,13 +839,16 @@ def train(cfg: dict):
     
     if accelerator.is_main_process:
         print(f"Found {len(train_files)} train, {len(val_files) if val_files else 0} val patients")
+        if use_body_mask:
+            print(f"Body mask training ENABLED - using mask pattern: {mask_pattern}")
         print("Creating datasets...")
     
     train_transforms = get_monai_nifti_transforms(mode="train", target_size=cfg["image_size"])
     train_dataset = MonaiNiftiSliceDataset(
         data=train_files,
         transform=train_transforms,
-        target_size=cfg["image_size"]
+        target_size=cfg["image_size"],
+        use_body_mask=use_body_mask,
     )
     
     if accelerator.is_main_process:
@@ -760,7 +872,8 @@ def train(cfg: dict):
         val_dataset = MonaiNiftiSliceDataset(
             data=val_files,
             transform=val_transforms,
-            target_size=cfg["image_size"]
+            target_size=cfg["image_size"],
+            use_body_mask=use_body_mask,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -864,6 +977,8 @@ def train(cfg: dict):
         for batch_idx, batch in enumerate(pbar):
             mr = batch["mr"]
             ct = batch["ct"]
+            # Get body mask if available (nnsyn-style training)
+            body_mask = batch.get("mask", None)
             
             batch_size = mr.shape[0]
             sigma = sample_sigma(
@@ -886,6 +1001,7 @@ def train(cfg: dict):
                     mask_threshold=cfg.get("mask_threshold", -0.7),
                     pfgmpp=cfg.get("pfgmpp", False),
                     D=cfg.get("D", 128),
+                    body_mask=body_mask,  # Pass body mask to loss function
                 )
                 
                 accelerator.backward(loss)
@@ -966,6 +1082,10 @@ def train(cfg: dict):
             sample_batch = next(iter(train_loader))
             mr_samples = sample_batch["mr"][:cfg["num_val_samples"]]
             ct_samples = sample_batch["ct"][:cfg["num_val_samples"]]
+            # Get body mask for masked metrics if available
+            sample_mask = sample_batch.get("mask", None)
+            if sample_mask is not None:
+                sample_mask = sample_mask[:cfg["num_val_samples"]]
             
             # Only main process does generation and logging
             if accelerator.is_main_process:
@@ -1008,25 +1128,35 @@ def train(cfg: dict):
                             D=cfg.get("D", 128),
                         )
                     
-                    pred_ct = torch.clamp(pred_ct, -1.0, 1.0)
-                    pred_ct_01 = (pred_ct + 1.0) / 2.0
-                    ct_samples_01 = (ct_samples + 1.0) / 2.0
+                    pred_ct = torch.clamp(pred_ct, -3.0, 3.0)
+                    pred_ct_01 = (pred_ct + 3.0) / 6.0
+                    ct_samples_01 = (ct_samples + 3.0) / 6.0
+                    
+                    # Prepare mask for metrics (scale to [0,1] range)
+                    mask_for_metrics = None
+                    if sample_mask is not None and cfg.get("use_body_mask", False):
+                        mask_for_metrics = sample_mask.to(pred_ct.device)
                     
                     if psnr_metric is not None:
-                        psnr_val = psnr_metric(pred_ct_01, ct_samples_01)
-                        ssim_val = ssim_metric(pred_ct_01, ct_samples_01)
-                        mae_val = mae_metric(pred_ct_01, ct_samples_01) if mae_metric else None
+                        gen_metrics = compute_masked_metrics(
+                            pred_ct_01, ct_samples_01,
+                            mask=mask_for_metrics,
+                            psnr_metric=psnr_metric,
+                            ssim_metric=ssim_metric,
+                            mae_metric=mae_metric,
+                        )
                         
                         log_dict = {
-                            "gen/psnr": psnr_val.item(),
-                            "gen/ssim": ssim_val.item(),
+                            "gen/psnr": gen_metrics.get('psnr', 0.0),
+                            "gen/ssim": gen_metrics.get('ssim', 0.0),
                         }
-                        if mae_val is not None:
-                            log_dict["gen/mae"] = mae_val.item()
+                        if 'mae' in gen_metrics:
+                            log_dict["gen/mae"] = gen_metrics['mae']
                         
                         accelerator.log(log_dict, step=epoch)
-                        mae_str = f", MAE={mae_val:.5f}" if mae_val else ""
-                        print(f"  Generation: PSNR={psnr_val:.3f}, SSIM={ssim_val:.5f}{mae_str}")
+                        mae_str = f", MAE={gen_metrics['mae']:.5f}" if 'mae' in gen_metrics else ""
+                        mask_str = " (masked)" if mask_for_metrics is not None else ""
+                        print(f"  Generation{mask_str}: PSNR={gen_metrics.get('psnr', 0.0):.3f}, SSIM={gen_metrics.get('ssim', 0.0):.5f}{mae_str}")
                     
                     # Log training sample images to TensorBoard
                     img_grid = vutils.make_grid(
@@ -1051,6 +1181,8 @@ def train(cfg: dict):
                 for batch in val_loader:
                     mr = batch["mr"]
                     ct = batch["ct"]
+                    # Get body mask for masked loss if available
+                    val_body_mask = batch.get("mask", None)
                     
                     sigma = sample_sigma(
                         batch_size=ct.shape[0],
@@ -1067,6 +1199,7 @@ def train(cfg: dict):
                         loss_type=cfg["loss_type"],
                         pfgmpp=cfg.get("pfgmpp", False),
                         D=cfg.get("D", 128),
+                        body_mask=val_body_mask,
                     )
                     val_loss_accum += loss.item()
                     val_batches += 1
@@ -1088,6 +1221,10 @@ def train(cfg: dict):
             val_sample_batch = next(iter(val_loader))
             mr_val_samples = val_sample_batch["mr"][:cfg["num_val_samples"]]
             ct_val_samples = val_sample_batch["ct"][:cfg["num_val_samples"]]
+            # Get body mask for masked metrics if available
+            val_sample_mask = val_sample_batch.get("mask", None)
+            if val_sample_mask is not None:
+                val_sample_mask = val_sample_mask[:cfg["num_val_samples"]]
             
             # Only main process does generation and logging
             if accelerator.is_main_process and psnr_metric is not None:
@@ -1106,26 +1243,36 @@ def train(cfg: dict):
                     D=cfg.get("D", 128),
                 )
                 
-                pred_val_ct = torch.clamp(pred_val_ct, -1.0, 1.0)
-                pred_val_ct_01 = (pred_val_ct + 1.0) / 2.0
-                ct_val_samples_01 = (ct_val_samples + 1.0) / 2.0
+                pred_val_ct = torch.clamp(pred_val_ct, -3.0, 3.0)
+                pred_val_ct_01 = (pred_val_ct + 3.0) / 6.0
+                ct_val_samples_01 = (ct_val_samples + 3.0) / 6.0
                 
-                # Compute validation generation metrics
-                val_psnr = psnr_metric(pred_val_ct_01, ct_val_samples_01)
-                val_ssim = ssim_metric(pred_val_ct_01, ct_val_samples_01)
-                val_mae = mae_metric(pred_val_ct_01, ct_val_samples_01) if mae_metric else None
+                # Prepare mask for validation metrics
+                val_mask_for_metrics = None
+                if val_sample_mask is not None and cfg.get("use_body_mask", False):
+                    val_mask_for_metrics = val_sample_mask.to(pred_val_ct.device)
+                
+                # Compute validation generation metrics with optional masking
+                val_gen_metrics = compute_masked_metrics(
+                    pred_val_ct_01, ct_val_samples_01,
+                    mask=val_mask_for_metrics,
+                    psnr_metric=psnr_metric,
+                    ssim_metric=ssim_metric,
+                    mae_metric=mae_metric,
+                )
                 
                 val_gen_log = {
-                    "val_gen/psnr": val_psnr.item(),
-                    "val_gen/ssim": val_ssim.item(),
+                    "val_gen/psnr": val_gen_metrics.get('psnr', 0.0),
+                    "val_gen/ssim": val_gen_metrics.get('ssim', 0.0),
                 }
-                if val_mae is not None:
-                    val_gen_log["val_gen/mae"] = val_mae.item()
+                if 'mae' in val_gen_metrics:
+                    val_gen_log["val_gen/mae"] = val_gen_metrics['mae']
                 
                 accelerator.log(val_gen_log, step=epoch)
                 
-                val_mae_str = f", MAE={val_mae:.5f}" if val_mae else ""
-                print(f"  Val Generation: PSNR={val_psnr:.3f}, SSIM={val_ssim:.5f}{val_mae_str}")
+                val_mae_str = f", MAE={val_gen_metrics['mae']:.5f}" if 'mae' in val_gen_metrics else ""
+                val_mask_str = " (masked)" if val_mask_for_metrics is not None else ""
+                print(f"  Val Generation{val_mask_str}: PSNR={val_gen_metrics.get('psnr', 0.0):.3f}, SSIM={val_gen_metrics.get('ssim', 0.0):.5f}{val_mae_str}")
                 
                 # Log validation sample images to TensorBoard
                 val_img_grid = vutils.make_grid(
