@@ -28,6 +28,7 @@ from .fir_blocks import (
     FIRResBlock,
     Downsample,
     Upsample,
+    LayerNorm2d,
 )
 from .network import SwinFIRUNet, SwinFIRUNetConfig, create_swin_fir_unet
 

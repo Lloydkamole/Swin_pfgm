@@ -38,7 +38,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .embeddings import RadiusEmbedding
-from .fir_blocks import FIRResBlock, Downsample, Upsample, SFB
+from .fir_blocks import FIRResBlock, Downsample, Upsample, SFB, LayerNorm2d
 
 
 class SwinFIRUNet(nn.Module):
@@ -216,16 +216,8 @@ class SwinFIRUNet(nn.Module):
             
             self.decoder_stages.append(stage_blocks)
         
-        # Final output - use flexible group count
-        def get_num_groups(channels, target=32):
-            if channels >= target and channels % target == 0:
-                return target
-            for g in [32, 16, 8, 4, 2, 1]:
-                if channels % g == 0:
-                    return g
-            return 1
-        
-        self.final_norm = nn.GroupNorm(get_num_groups(base_channels), base_channels)
+        # Final output - use LayerNorm2d for consistent normalization
+        self.final_norm = LayerNorm2d(base_channels)
         self.final_conv = nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1)
         
         # Initialize output conv to small values

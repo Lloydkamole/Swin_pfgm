@@ -60,12 +60,105 @@ except Exception:
 
 
 # =============================================================================
+# EMA (Exponential Moving Average)
+# =============================================================================
+
+class EMA:
+    """
+    Exponential Moving Average for model weights.
+    
+    Maintains a shadow copy of model parameters that are updated with
+    exponential moving average. This typically improves generation quality
+    by 1-3 dB PSNR in diffusion models.
+    
+    Usage:
+        ema = EMA(model, decay=0.9999)
+        
+        # In training loop after optimizer.step():
+        ema.update()
+        
+        # For inference/validation:
+        ema.apply_shadow()  # Use EMA weights
+        ... do inference ...
+        ema.restore()       # Restore original weights
+    """
+    
+    def __init__(self, model: nn.Module, decay: float = 0.9999, device: torch.device = None):
+        """
+        Args:
+            model: Model to track
+            decay: EMA decay rate (0.9999 is typical for diffusion models)
+            device: Device to store shadow weights (None = same as model)
+        """
+        self.model = model
+        self.decay = decay
+        self.device = device
+        self.shadow = {}
+        self.backup = {}
+        self.num_updates = 0
+        
+        # Initialize shadow weights
+        self._init_shadow()
+    
+    def _init_shadow(self):
+        """Initialize shadow weights from current model weights."""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                if self.device is not None:
+                    self.shadow[name] = param.data.clone().to(self.device)
+                else:
+                    self.shadow[name] = param.data.clone()
+    
+    @torch.no_grad()
+    def update(self):
+        """Update shadow weights with exponential moving average."""
+        self.num_updates += 1
+        
+        # Use warmup: start with lower decay and increase to target decay
+        # This helps during early training when weights change rapidly
+        decay = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
+        
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                # EMA update: shadow = decay * shadow + (1 - decay) * param
+                self.shadow[name].mul_(decay).add_(param.data, alpha=1 - decay)
+    
+    def apply_shadow(self):
+        """Apply shadow (EMA) weights to model, backing up current weights."""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+    
+    def restore(self):
+        """Restore original weights from backup."""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data.copy_(self.backup[name])
+        self.backup = {}
+    
+    def state_dict(self):
+        """Return EMA state for checkpointing."""
+        return {
+            'shadow': self.shadow,
+            'num_updates': self.num_updates,
+            'decay': self.decay,
+        }
+    
+    def load_state_dict(self, state_dict):
+        """Load EMA state from checkpoint."""
+        self.shadow = state_dict['shadow']
+        self.num_updates = state_dict['num_updates']
+        self.decay = state_dict.get('decay', self.decay)
+
+
+# =============================================================================
 # CONFIGURATION
 # =============================================================================
 
 config = {
     # Data Settings
-    "data_dir": "/home/lloyd/Documents/AR PFGM/pfgm_train",
+    "data_dir": "/mnt/nvme/lloyd/DL project CT-MRI/pfgm_train_brain",
     "mr_pattern": "mr.nii", # Suffix pattern to match MRI files
     "ct_pattern": "ct.nii", # Suffix pattern to match CT files
     "train_split": 0.9,
@@ -73,27 +166,27 @@ config = {
     
     # Model Architecture
     "model_config": "custom", # "custom" or predefined config name
-    "base_channels": 128,   # Reduced from 128 for memory
+    "base_channels": 64,   # Reduced from 128 for memory
     "channel_mults": [1, 2, 4, 8],
-    "num_res_blocks": 2,  # Number of times the Swin+SFB block repeats per encoder/decoder stage
+    "num_res_blocks": 1,  # Number of times the Swin+SFB block repeats per encoder/decoder stage
     "attention_resolutions": [],  # Reduced: only use attention at lower resolutions
-    "num_heads": 4,
+    "num_heads": 8,
     "mlp_ratio": 4.0, # MLP expansion ratio in transformer blocks
     "radius_emb_dim": 256,
-    "window_size": 8, # Swin Transformer window size
-    "num_swin_blocks": 2,  # Number of Swin attention blocks per FIRResBlock (W-MSA + SW-MSA pattern)
+    "window_size": 4, # Swin Transformer window size
+    "num_swin_blocks": 4,  # Number of Swin attention blocks per FIRResBlock (W-MSA + SW-MSA pattern)
     "num_sfb_blocks": 1,   # Number of SFB blocks per FIRResBlock (sequential after Swin)
     "num_bottleneck_blocks": 4,  # Number of residual blocks in the bottleneck
     "use_sfb": True,  # Use Spatial-Frequency Blocks
-    "dropout": 0.05,
-    "drop_path": 0.05,
+    "dropout": 0.025,
+    "drop_path": 0.025,
     
     # EDM Parameters
     "sigma_min": 0.002,
     "sigma_max": 80.0,
-    "sigma_data": 0.5,
-    "P_mean": -1.2,
-    "P_std": 1.2,
+    "sigma_data": 1.0, # 0.5 for [-1,1] normalized data, 1.0 for z-normalized
+    "P_mean": 0.0, #changed for pfgm++
+    "P_std": 1.5,   # changed for pfgm++
     "rho": 7.0,
     "loss_type": "l2",
     
@@ -105,14 +198,26 @@ config = {
     "cond_drop_prob": 0.2,               # Probability of dropping MRI conditioning (0.0 = no CFG)
     "cfg_scale": 2.0,                    # Guidance scale at inference (1.0 = no guidance)
     
+    # CFG++ and Dynamic Scaling (for sampling/generation)
+    "use_cfg_plus_plus": True,           # Use CFG++ manifold constraints
+    "cfg_rescale_factor": 0.7,           # Rescale factor for CFG++ (0.0 = no rescale, 1.0 = full rescale)
+    "use_dynamic_cfg": True,             # Use dynamic CFG scaling
+    "cfg_scale_min": 1.0,                # Minimum CFG scale (at end of sampling)
+    "cfg_scale_max": 3.0,                # Maximum CFG scale (at start of sampling)
+    
     # Masked Loss (Anatomical Focusing)
     "use_masked_loss": False,             # Enable masked loss (body-only)
     "masked_loss_ratio": 0,            # Ratio of samples using masked loss (0.0-1.0) 
-    "mask_threshold": -0.7,              # Threshold for body mask in normalized [-1,1] range
+    "mask_threshold": 0.0,              # Threshold for body mask in z-normalized range (adjust based on data)
+    
+    # Body Mask Training (nnsyn-style anatomically-focused training)
+    "use_body_mask": False,              # Enable body mask loading and masked training
+    "mask_pattern": "mask.nii",          # Suffix pattern to match mask files
+    "mask_outside_value": -1.0,          # Value to use for regions outside the mask in generated images
     
     # Training Parameters
     "num_epochs": 150,
-    "batch_size": 3,  # Per GPU batch size (reduced for memory)
+    "batch_size": 10,  # Per GPU batch size (reduced for memory)
     "lr": 1e-4,
     "weight_decay": 0.01,
     "grad_clip": None,  # Enable gradient clipping
@@ -139,6 +244,11 @@ config = {
     "seed": 42,
     "num_workers": 4,
     "mixed_precision": "no",  # "no", "fp16", or "bf16"
+    
+    # EMA (Exponential Moving Average)
+    "use_ema": True,                     # Enable EMA for smoother weights
+    "ema_decay": 0.9999,                 # EMA decay rate (higher = slower update)
+    "ema_update_every": 1,               # Update EMA every N steps
 }
 
 
@@ -146,8 +256,9 @@ config = {
 # Utility Functions
 # =============================================================================
 
-def collect_data_files(data_path: str, mr_pattern: str = "mr.nii", ct_pattern: str = "ct.nii"):
-    """Collect MR and CT file pairs from directory structure."""
+def collect_data_files(data_path: str, mr_pattern: str = "mr.nii", ct_pattern: str = "ct.nii", 
+                       mask_pattern: str = "mask.nii", use_body_mask: bool = False):
+    """Collect MR, CT, and optionally mask file pairs from directory structure."""
     data_files = []
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"Data path not found: {data_path}")
@@ -159,14 +270,22 @@ def collect_data_files(data_path: str, mr_pattern: str = "mr.nii", ct_pattern: s
         
         mr_file = None
         ct_file = None
+        mask_file = None
         for filename in os.listdir(patient_path):
             if mr_pattern in filename:
                 mr_file = os.path.join(patient_path, filename)
             if ct_pattern in filename:
                 ct_file = os.path.join(patient_path, filename)
+            if use_body_mask and mask_pattern in filename:
+                mask_file = os.path.join(patient_path, filename)
         
         if mr_file and ct_file:
-            data_files.append({"mr": mr_file, "ct": ct_file, "id": patient_dir})
+            entry = {"mr": mr_file, "ct": ct_file, "id": patient_dir}
+            if use_body_mask:
+                entry["mask"] = mask_file  # Can be None if not found
+                if mask_file is None:
+                    print(f"Warning: No mask found for patient {patient_dir}")
+            data_files.append(entry)
     
     return data_files
 
@@ -410,18 +529,24 @@ def edm_loss(
     mask_threshold: float = -0.7,
     pfgmpp: bool = False,
     D: int = 128,
+    body_mask: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute EDM/PFGM++ loss with optional classifier-free guidance training and masked loss.
     
+    Supports two masking modes:
+    1. Threshold-based: Generate mask from CT (old method, use_masked_loss=True, body_mask=None)
+    2. Body mask: Use explicit body contour mask from dataloader (body_mask not None)
+    
     Args:
         cond_drop_prob: Probability of dropping MRI conditioning (replacing with zeros).
                         Set to 0.0 to disable CFG training.
-        use_masked_loss: If True, apply body masking to focus loss on anatomy.
-        masked_loss_ratio: Probability of using masked loss (0.0-1.0).
+        use_masked_loss: If True, apply body masking to focus loss on anatomy (threshold-based).
+        masked_loss_ratio: Probability of using masked loss (0.0-1.0) for threshold mode.
         mask_threshold: Threshold for body mask (pixels > threshold are body).
         pfgmpp: If True, use PFGM++ perturbation (inverse-beta) instead of Gaussian.
         D: Augmented dimension for PFGM++ (D→∞ recovers EDM/Gaussian).
+        body_mask: Optional explicit body mask [B, 1, H, W] from dataloader (nnsyn-style).
     
     Returns:
         loss: Scalar loss value
@@ -446,19 +571,23 @@ def edm_loss(
     
     sigma_v = sigma.view(-1, 1, 1, 1)
     weight = (sigma_v ** 2 + sigma_data ** 2) / ((sigma_v * sigma_data) ** 2)
-    weight = weight.clamp(max=100.0)
+    weight = weight.clamp(max=1000.0)
     
-    # Generate body mask if using masked loss
-    body_mask = None
+    # Apply body mask if provided (nnsyn-style masked training)
+    mask_used = None
     use_mask_this_batch = False
-    if use_masked_loss and model.training:
-        # Randomly decide whether to use masking for this batch
+    
+    if body_mask is not None:
+        # Use explicit body mask from dataloader
+        use_mask_this_batch = True
+        mask_used = body_mask
+        weight = weight * body_mask
+    elif use_masked_loss and model.training:
+        # Fallback: Generate mask from CT threshold (old method)
         if torch.rand(1).item() < masked_loss_ratio:
             use_mask_this_batch = True
-            # Generate mask from CT (body = pixels > threshold)
-            body_mask = (x_clean > mask_threshold).float()
-            # Combine with weight
-            weight = weight * body_mask
+            mask_used = (x_clean > mask_threshold).float()
+            weight = weight * mask_used
     
     if loss_type == 'l1':
         loss = (weight * (D_x - x_clean).abs()).mean()
@@ -471,7 +600,19 @@ def edm_loss(
     
     # Metrics for logging (matching train_pfgm_fir.py)
     with torch.no_grad():
-        mse = F.mse_loss(D_x, x_clean).item()
+        # Compute MSE only on masked region if mask is used
+        if mask_used is not None:
+            # Masked MSE (nnsyn-style)
+            masked_pred = D_x * mask_used
+            masked_target = x_clean * mask_used
+            num_masked_pixels = mask_used.sum()
+            if num_masked_pixels > 0:
+                mse = ((masked_pred - masked_target) ** 2).sum() / num_masked_pixels
+                mse = mse.item()
+            else:
+                mse = F.mse_loss(D_x, x_clean).item()
+        else:
+            mse = F.mse_loss(D_x, x_clean).item()
         pred_std = D_x.std().item()
         target_std = x_clean.std().item()
     
@@ -485,14 +626,116 @@ def edm_loss(
     }
     
     # Add mask statistics if used
-    if use_mask_this_batch and body_mask is not None:
-        mask_ratio = body_mask.mean().item()
+    if use_mask_this_batch and mask_used is not None:
+        mask_ratio = mask_used.mean().item()
         metrics['mask_ratio'] = mask_ratio
         metrics['masked'] = 1.0
     else:
         metrics['masked'] = 0.0
     
     return loss, metrics
+
+
+def compute_masked_metrics(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor = None,
+    psnr_metric=None,
+    ssim_metric=None,
+    mae_metric=None,
+) -> Dict[str, float]:
+    """
+    Compute image quality metrics with optional masking (nnsyn-style).
+    
+    When mask is provided, metrics are computed only on the body region.
+    Outside regions are set to a constant value before computing metrics.
+    
+    Args:
+        pred: Predicted image [B, C, H, W] in [0, 1] range
+        target: Target image [B, C, H, W] in [0, 1] range
+        mask: Binary body mask [B, C, H, W] (1=body, 0=outside)
+        psnr_metric: torchmetrics PSNR object
+        ssim_metric: torchmetrics SSIM object
+        mae_metric: torchmetrics MAE object
+    
+    Returns:
+        Dictionary with psnr, ssim, mae values
+    """
+    metrics = {}
+    
+    if mask is not None:
+        # Apply mask - set outside region to 0 for fair comparison
+        # This follows nnsyn approach where outside is set to constant value
+        pred_masked = pred * mask
+        target_masked = target * mask
+    else:
+        pred_masked = pred
+        target_masked = target
+    
+    if psnr_metric is not None:
+        psnr_val = psnr_metric(pred_masked, target_masked)
+        metrics['psnr'] = psnr_val.item()
+    
+    if ssim_metric is not None:
+        # For SSIM with mask, we follow nnsyn approach
+        if mask is not None:
+            # Set outside to same value to not affect SSIM
+            pred_for_ssim = pred * mask + (1 - mask) * 0.0
+            target_for_ssim = target * mask + (1 - mask) * 0.0
+            ssim_val = ssim_metric(pred_for_ssim, target_for_ssim)
+        else:
+            ssim_val = ssim_metric(pred_masked, target_masked)
+        metrics['ssim'] = ssim_val.item()
+    
+    if mae_metric is not None:
+        if mask is not None:
+            # Compute MAE only on masked region
+            num_masked = mask.sum()
+            if num_masked > 0:
+                mae_val = (pred_masked - target_masked).abs().sum() / num_masked
+                metrics['mae'] = mae_val.item()
+            else:
+                metrics['mae'] = mae_metric(pred, target).item()
+        else:
+            mae_val = mae_metric(pred_masked, target_masked)
+            metrics['mae'] = mae_val.item()
+    
+    return metrics
+
+
+def apply_cfg_plus_plus(denoised_cond: torch.Tensor, denoised_uncond: torch.Tensor, 
+                         cfg_scale: float, rescale_factor: float = 0.7) -> torch.Tensor:
+    """
+    Apply CFG++ with manifold constraints (rescaling).
+    
+    Standard CFG can push samples off the data manifold, causing oversaturation.
+    CFG++ rescales the output to match the statistics of the conditional prediction,
+    keeping samples closer to the learned manifold.
+    
+    Args:
+        denoised_cond: Conditional denoised prediction
+        denoised_uncond: Unconditional denoised prediction  
+        cfg_scale: Guidance scale
+        rescale_factor: How much to rescale (0.0 = standard CFG, 1.0 = full rescale)
+    
+    Returns:
+        CFG++ guided denoised prediction
+    """
+    # Standard CFG
+    denoised_cfg = denoised_uncond + cfg_scale * (denoised_cond - denoised_uncond)
+    
+    if rescale_factor > 0:
+        # Compute std of conditional and CFG outputs (per sample)
+        std_cond = denoised_cond.std(dim=[1, 2, 3], keepdim=True)
+        std_cfg = denoised_cfg.std(dim=[1, 2, 3], keepdim=True)
+        
+        # Rescale CFG output to match conditional std
+        rescale = std_cond / (std_cfg + 1e-8)
+        
+        # Interpolate between standard CFG and rescaled CFG
+        denoised_cfg = rescale_factor * (denoised_cfg * rescale) + (1 - rescale_factor) * denoised_cfg
+    
+    return denoised_cfg
 
 
 @torch.no_grad()
@@ -512,6 +755,12 @@ def edm_sample(
     cfg_scale: float = 1.0,
     pfgmpp: bool = False,
     D: int = 128,
+    # CFG++ and Dynamic Scaling options
+    use_cfg_plus_plus: bool = False,
+    cfg_rescale_factor: float = 0.7,
+    use_dynamic_cfg: bool = False,
+    cfg_scale_min: float = 1.0,
+    cfg_scale_max: float = 3.0,
 ) -> torch.Tensor:
     """
     Generate CT images from MRI using EDM/PFGM++ sampling.
@@ -519,12 +768,21 @@ def edm_sample(
     This is a deterministic ODE sampler with optional stochasticity.
     When pfgmpp=True, uses PFGM++ prior (inverse-beta) for initialization.
     
+    Enhanced with:
+    - CFG++ (manifold constraints): Rescales CFG output to match conditional statistics
+    - Dynamic CFG scaling: Linearly decreases guidance from cfg_scale_max to cfg_scale_min
+    
     Args:
         return_trajectory_stats: If True, returns (samples, stats_dict) with ODE trajectory info
         cfg_scale: Classifier-free guidance scale. 1.0 = no guidance, >1.0 = stronger conditioning.
                    Requires model trained with cond_drop_prob > 0.
         pfgmpp: If True, use PFGM++ prior (inverse-beta) instead of Gaussian.
         D: Augmented dimension for PFGM++.
+        use_cfg_plus_plus: Enable CFG++ manifold constraints.
+        cfg_rescale_factor: Rescale factor for CFG++ (0=standard, 1=full rescale).
+        use_dynamic_cfg: Enable dynamic CFG scaling.
+        cfg_scale_min: Minimum CFG scale (at end of sampling).
+        cfg_scale_max: Maximum CFG scale (at start of sampling).
     """
     B, C, H, W = mri.shape
     device = mri.device
@@ -554,8 +812,18 @@ def edm_sample(
     score_norms = []
     update_norms = []
     
+    # Precompute unconditional input for CFG
+    mri_uncond = torch.zeros_like(mri) if cfg_scale != 1.0 or use_dynamic_cfg else None
+    
     for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
         x_cur = x_next
+        
+        # Dynamic CFG: linearly interpolate from cfg_scale_max to cfg_scale_min
+        if use_dynamic_cfg:
+            progress = i / (num_steps - 1)  # 0 at start, 1 at end
+            current_cfg_scale = cfg_scale_max + progress * (cfg_scale_min - cfg_scale_max)
+        else:
+            current_cfg_scale = cfg_scale
         
         # Increase noise temporarily (stochasticity)
         gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
@@ -565,11 +833,15 @@ def edm_sample(
         sigma_batch = torch.full((B,), t_hat.item(), device=device, dtype=torch.float32)
         denoised_cond = edm_precond(model, x_hat.float(), mri, sigma_batch, sigma_data).double()
         
-        # Classifier-free guidance
-        if cfg_scale != 1.0:
-            mri_uncond = torch.zeros_like(mri)
+        # Classifier-free guidance (standard or CFG++)
+        if current_cfg_scale != 1.0:
             denoised_uncond = edm_precond(model, x_hat.float(), mri_uncond, sigma_batch, sigma_data).double()
-            denoised = denoised_uncond + cfg_scale * (denoised_cond - denoised_uncond)
+            
+            if use_cfg_plus_plus:
+                denoised = apply_cfg_plus_plus(denoised_cond, denoised_uncond, 
+                                                current_cfg_scale, cfg_rescale_factor)
+            else:
+                denoised = denoised_uncond + current_cfg_scale * (denoised_cond - denoised_uncond)
         else:
             denoised = denoised_cond
         
@@ -577,14 +849,20 @@ def edm_sample(
         update = (t_next - t_hat) * d_cur
         x_next = x_hat + update
         
+        # Heun's 2nd order correction
         if i < num_steps - 1 and t_next > 0:
             sigma_batch = torch.full((B,), t_next.item(), device=device, dtype=torch.float32)
             denoised_cond_next = edm_precond(model, x_next.float(), mri, sigma_batch, sigma_data).double()
             
             # CFG for Heun correction
-            if cfg_scale != 1.0:
+            if current_cfg_scale != 1.0:
                 denoised_uncond_next = edm_precond(model, x_next.float(), mri_uncond, sigma_batch, sigma_data).double()
-                denoised_next = denoised_uncond_next + cfg_scale * (denoised_cond_next - denoised_uncond_next)
+                
+                if use_cfg_plus_plus:
+                    denoised_next = apply_cfg_plus_plus(denoised_cond_next, denoised_uncond_next,
+                                                         current_cfg_scale, cfg_rescale_factor)
+                else:
+                    denoised_next = denoised_uncond_next + current_cfg_scale * (denoised_cond_next - denoised_uncond_next)
             else:
                 denoised_next = denoised_cond_next
             
@@ -717,10 +995,16 @@ def train(cfg: dict):
     if accelerator.is_main_process:
         print("Loading data files...")
     
+    # Determine if using body mask
+    use_body_mask = cfg.get("use_body_mask", False)
+    mask_pattern = cfg.get("mask_pattern", "mask.nii")
+    
     all_files = collect_data_files(
         cfg["data_dir"],
         mr_pattern=cfg["mr_pattern"],
-        ct_pattern=cfg["ct_pattern"]
+        ct_pattern=cfg["ct_pattern"],
+        mask_pattern=mask_pattern,
+        use_body_mask=use_body_mask,
     )
     
     random.shuffle(all_files)
@@ -730,13 +1014,16 @@ def train(cfg: dict):
     
     if accelerator.is_main_process:
         print(f"Found {len(train_files)} train, {len(val_files) if val_files else 0} val patients")
+        if use_body_mask:
+            print(f"Body mask training ENABLED - using mask pattern: {mask_pattern}")
         print("Creating datasets...")
     
     train_transforms = get_monai_nifti_transforms(mode="train", target_size=cfg["image_size"])
     train_dataset = MonaiNiftiSliceDataset(
         data=train_files,
         transform=train_transforms,
-        target_size=cfg["image_size"]
+        target_size=cfg["image_size"],
+        use_body_mask=use_body_mask,
     )
     
     if accelerator.is_main_process:
@@ -760,7 +1047,8 @@ def train(cfg: dict):
         val_dataset = MonaiNiftiSliceDataset(
             data=val_files,
             transform=val_transforms,
-            target_size=cfg["image_size"]
+            target_size=cfg["image_size"],
+            use_body_mask=use_body_mask,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -821,6 +1109,18 @@ def train(cfg: dict):
     if val_loader is not None:
         val_loader = accelerator.prepare(val_loader)
     
+    # Initialize EMA (Exponential Moving Average)
+    ema = None
+    if cfg.get("use_ema", True):
+        unwrapped_model = accelerator.unwrap_model(model)
+        ema = EMA(
+            unwrapped_model,
+            decay=cfg.get("ema_decay", 0.9999),
+            device=accelerator.device,
+        )
+        if accelerator.is_main_process:
+            print(f"EMA enabled with decay={cfg.get('ema_decay', 0.9999)}")
+    
     # Initialize tracking (convert non-primitive types to strings for TensorBoard)
     trackable_cfg = {}
     for k, v in cfg.items():
@@ -864,6 +1164,8 @@ def train(cfg: dict):
         for batch_idx, batch in enumerate(pbar):
             mr = batch["mr"]
             ct = batch["ct"]
+            # Get body mask if available (nnsyn-style training)
+            body_mask = batch.get("mask", None)
             
             batch_size = mr.shape[0]
             sigma = sample_sigma(
@@ -886,6 +1188,7 @@ def train(cfg: dict):
                     mask_threshold=cfg.get("mask_threshold", -0.7),
                     pfgmpp=cfg.get("pfgmpp", False),
                     D=cfg.get("D", 128),
+                    body_mask=body_mask,  # Pass body mask to loss function
                 )
                 
                 accelerator.backward(loss)
@@ -896,6 +1199,10 @@ def train(cfg: dict):
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+                
+                # Update EMA weights
+                if ema is not None and global_step % cfg.get("ema_update_every", 1) == 0:
+                    ema.update()
             
             epoch_loss += loss.item()
             num_batches += 1
@@ -966,6 +1273,10 @@ def train(cfg: dict):
             sample_batch = next(iter(train_loader))
             mr_samples = sample_batch["mr"][:cfg["num_val_samples"]]
             ct_samples = sample_batch["ct"][:cfg["num_val_samples"]]
+            # Get body mask for masked metrics if available
+            sample_mask = sample_batch.get("mask", None)
+            if sample_mask is not None:
+                sample_mask = sample_mask[:cfg["num_val_samples"]]
             
             # Only main process does generation and logging
             if accelerator.is_main_process:
@@ -973,6 +1284,11 @@ def train(cfg: dict):
                 
                     # Get unwrapped model for sampling
                     unwrapped_model = accelerator.unwrap_model(model)
+                    
+                    # Apply EMA weights for better generation quality
+                    if ema is not None:
+                        ema.apply_shadow()
+                    
                     # Sample with optional ODE trajectory logging
                     if cfg.get("log_ode_trajectory", False):
                         pred_ct, ode_stats = edm_sample(
@@ -986,6 +1302,12 @@ def train(cfg: dict):
                             cfg_scale=cfg.get("cfg_scale", 1.0),
                             pfgmpp=cfg.get("pfgmpp", False),
                             D=cfg.get("D", 128),
+                            # CFG++ and Dynamic Scaling
+                            use_cfg_plus_plus=cfg.get("use_cfg_plus_plus", False),
+                            cfg_rescale_factor=cfg.get("cfg_rescale_factor", 0.7),
+                            use_dynamic_cfg=cfg.get("use_dynamic_cfg", False),
+                            cfg_scale_min=cfg.get("cfg_scale_min", 1.0),
+                            cfg_scale_max=cfg.get("cfg_scale_max", 3.0),
                         )
                         # Log ODE trajectory stats
                         accelerator.log({
@@ -1006,27 +1328,43 @@ def train(cfg: dict):
                             cfg_scale=cfg.get("cfg_scale", 1.0),
                             pfgmpp=cfg.get("pfgmpp", False),
                             D=cfg.get("D", 128),
+                            # CFG++ and Dynamic Scaling
+                            use_cfg_plus_plus=cfg.get("use_cfg_plus_plus", False),
+                            cfg_rescale_factor=cfg.get("cfg_rescale_factor", 0.7),
+                            use_dynamic_cfg=cfg.get("use_dynamic_cfg", False),
+                            cfg_scale_min=cfg.get("cfg_scale_min", 1.0),
+                            cfg_scale_max=cfg.get("cfg_scale_max", 3.0),
                         )
                     
-                    pred_ct = torch.clamp(pred_ct, -1.0, 1.0)
-                    pred_ct_01 = (pred_ct + 1.0) / 2.0
-                    ct_samples_01 = (ct_samples + 1.0) / 2.0
+                    pred_ct = torch.clamp(pred_ct, -3.0, 3.0)
+                    pred_ct_01 = (pred_ct + 3.0) / 6.0
+                    ct_samples_01 = (ct_samples + 3.0) / 6.0
+                    
+                    # Prepare mask for metrics (scale to [0,1] range)
+                    mask_for_metrics = None
+                    if sample_mask is not None and cfg.get("use_body_mask", False):
+                        mask_for_metrics = sample_mask.to(pred_ct.device)
                     
                     if psnr_metric is not None:
-                        psnr_val = psnr_metric(pred_ct_01, ct_samples_01)
-                        ssim_val = ssim_metric(pred_ct_01, ct_samples_01)
-                        mae_val = mae_metric(pred_ct_01, ct_samples_01) if mae_metric else None
+                        gen_metrics = compute_masked_metrics(
+                            pred_ct_01, ct_samples_01,
+                            mask=mask_for_metrics,
+                            psnr_metric=psnr_metric,
+                            ssim_metric=ssim_metric,
+                            mae_metric=mae_metric,
+                        )
                         
                         log_dict = {
-                            "gen/psnr": psnr_val.item(),
-                            "gen/ssim": ssim_val.item(),
+                            "gen/psnr": gen_metrics.get('psnr', 0.0),
+                            "gen/ssim": gen_metrics.get('ssim', 0.0),
                         }
-                        if mae_val is not None:
-                            log_dict["gen/mae"] = mae_val.item()
+                        if 'mae' in gen_metrics:
+                            log_dict["gen/mae"] = gen_metrics['mae']
                         
                         accelerator.log(log_dict, step=epoch)
-                        mae_str = f", MAE={mae_val:.5f}" if mae_val else ""
-                        print(f"  Generation: PSNR={psnr_val:.3f}, SSIM={ssim_val:.5f}{mae_str}")
+                        mae_str = f", MAE={gen_metrics['mae']:.5f}" if 'mae' in gen_metrics else ""
+                        mask_str = " (masked)" if mask_for_metrics is not None else ""
+                        print(f"  Generation{mask_str}: PSNR={gen_metrics.get('psnr', 0.0):.3f}, SSIM={gen_metrics.get('ssim', 0.0):.5f}{mae_str}")
                     
                     # Log training sample images to TensorBoard
                     img_grid = vutils.make_grid(
@@ -1039,6 +1377,10 @@ def train(cfg: dict):
                     tb_tracker = accelerator.get_tracker("tensorboard")
                     if tb_tracker is not None:
                         tb_tracker.writer.add_image("Gen/MRI_Pred_GT", img_grid, epoch)
+                    
+                    # Restore original weights after EMA sampling
+                    if ema is not None:
+                        ema.restore()
             model.train()
         
         # Validation
@@ -1051,6 +1393,8 @@ def train(cfg: dict):
                 for batch in val_loader:
                     mr = batch["mr"]
                     ct = batch["ct"]
+                    # Get body mask for masked loss if available
+                    val_body_mask = batch.get("mask", None)
                     
                     sigma = sample_sigma(
                         batch_size=ct.shape[0],
@@ -1067,6 +1411,7 @@ def train(cfg: dict):
                         loss_type=cfg["loss_type"],
                         pfgmpp=cfg.get("pfgmpp", False),
                         D=cfg.get("D", 128),
+                        body_mask=val_body_mask,
                     )
                     val_loss_accum += loss.item()
                     val_batches += 1
@@ -1088,10 +1433,18 @@ def train(cfg: dict):
             val_sample_batch = next(iter(val_loader))
             mr_val_samples = val_sample_batch["mr"][:cfg["num_val_samples"]]
             ct_val_samples = val_sample_batch["ct"][:cfg["num_val_samples"]]
+            # Get body mask for masked metrics if available
+            val_sample_mask = val_sample_batch.get("mask", None)
+            if val_sample_mask is not None:
+                val_sample_mask = val_sample_mask[:cfg["num_val_samples"]]
             
             # Only main process does generation and logging
             if accelerator.is_main_process and psnr_metric is not None:
                 unwrapped_model = accelerator.unwrap_model(model)
+                
+                # Apply EMA weights for better generation quality
+                if ema is not None:
+                    ema.apply_shadow()
                 
                 # Generate samples from validation MRI
                 pred_val_ct = edm_sample(
@@ -1104,28 +1457,44 @@ def train(cfg: dict):
                     cfg_scale=cfg.get("cfg_scale", 1.0),
                     pfgmpp=cfg.get("pfgmpp", False),
                     D=cfg.get("D", 128),
+                    # CFG++ and Dynamic Scaling
+                    use_cfg_plus_plus=cfg.get("use_cfg_plus_plus", False),
+                    cfg_rescale_factor=cfg.get("cfg_rescale_factor", 0.7),
+                    use_dynamic_cfg=cfg.get("use_dynamic_cfg", False),
+                    cfg_scale_min=cfg.get("cfg_scale_min", 1.0),
+                    cfg_scale_max=cfg.get("cfg_scale_max", 3.0),
                 )
                 
-                pred_val_ct = torch.clamp(pred_val_ct, -1.0, 1.0)
-                pred_val_ct_01 = (pred_val_ct + 1.0) / 2.0
-                ct_val_samples_01 = (ct_val_samples + 1.0) / 2.0
+                pred_val_ct = torch.clamp(pred_val_ct, -3.0, 3.0)
+                pred_val_ct_01 = (pred_val_ct + 3.0) / 6.0
+                ct_val_samples_01 = (ct_val_samples + 3.0) / 6.0
                 
-                # Compute validation generation metrics
-                val_psnr = psnr_metric(pred_val_ct_01, ct_val_samples_01)
-                val_ssim = ssim_metric(pred_val_ct_01, ct_val_samples_01)
-                val_mae = mae_metric(pred_val_ct_01, ct_val_samples_01) if mae_metric else None
+                # Prepare mask for validation metrics
+                val_mask_for_metrics = None
+                if val_sample_mask is not None and cfg.get("use_body_mask", False):
+                    val_mask_for_metrics = val_sample_mask.to(pred_val_ct.device)
+                
+                # Compute validation generation metrics with optional masking
+                val_gen_metrics = compute_masked_metrics(
+                    pred_val_ct_01, ct_val_samples_01,
+                    mask=val_mask_for_metrics,
+                    psnr_metric=psnr_metric,
+                    ssim_metric=ssim_metric,
+                    mae_metric=mae_metric,
+                )
                 
                 val_gen_log = {
-                    "val_gen/psnr": val_psnr.item(),
-                    "val_gen/ssim": val_ssim.item(),
+                    "val_gen/psnr": val_gen_metrics.get('psnr', 0.0),
+                    "val_gen/ssim": val_gen_metrics.get('ssim', 0.0),
                 }
-                if val_mae is not None:
-                    val_gen_log["val_gen/mae"] = val_mae.item()
+                if 'mae' in val_gen_metrics:
+                    val_gen_log["val_gen/mae"] = val_gen_metrics['mae']
                 
                 accelerator.log(val_gen_log, step=epoch)
                 
-                val_mae_str = f", MAE={val_mae:.5f}" if val_mae else ""
-                print(f"  Val Generation: PSNR={val_psnr:.3f}, SSIM={val_ssim:.5f}{val_mae_str}")
+                val_mae_str = f", MAE={val_gen_metrics['mae']:.5f}" if 'mae' in val_gen_metrics else ""
+                val_mask_str = " (masked)" if val_mask_for_metrics is not None else ""
+                print(f"  Val Generation{val_mask_str}: PSNR={val_gen_metrics.get('psnr', 0.0):.3f}, SSIM={val_gen_metrics.get('ssim', 0.0):.5f}{val_mae_str}")
                 
                 # Log validation sample images to TensorBoard
                 val_img_grid = vutils.make_grid(
@@ -1137,6 +1506,10 @@ def train(cfg: dict):
                 tb_tracker = accelerator.get_tracker("tensorboard")
                 if tb_tracker is not None:
                     tb_tracker.writer.add_image("Val_Gen/MRI_Pred_GT", val_img_grid, epoch)
+                
+                # Restore original weights after EMA sampling
+                if ema is not None:
+                    ema.restore()
             
             model.train()
         

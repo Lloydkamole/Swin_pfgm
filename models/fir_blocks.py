@@ -20,6 +20,54 @@ from typing import Optional, Tuple
 from .swin_attention import SwinTransformerBlock
 
 
+class LayerNorm2d(nn.Module):
+    """
+    LayerNorm for 2D feature maps (channels-first format).
+    
+    This is preferred over GroupNorm for diffusion models because:
+    1. Normalizes each sample independently (better for varying batch sizes)
+    2. More consistent statistics across different channel configurations
+    3. Used by modern architectures like DiT, Stable Diffusion 3, etc.
+    
+    Args:
+        num_features: Number of channels (C in [B, C, H, W])
+        eps: Small constant for numerical stability
+        elementwise_affine: Whether to learn scale and shift parameters
+    """
+    
+    def __init__(self, num_features: int, eps: float = 1e-6, elementwise_affine: bool = True):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(num_features))
+            self.bias = nn.Parameter(torch.zeros(num_features))
+        else:
+            self.register_parameter('weight', None)
+            self.register_parameter('bias', None)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor of shape [B, C, H, W]
+        
+        Returns:
+            Normalized tensor of shape [B, C, H, W]
+        """
+        # Normalize over C, H, W dimensions (keep batch dimension independent)
+        mean = x.mean(dim=(1, 2, 3), keepdim=True)
+        var = x.var(dim=(1, 2, 3), keepdim=True, unbiased=False)
+        x = (x - mean) / torch.sqrt(var + self.eps)
+        
+        if self.elementwise_affine:
+            # Apply learnable scale and shift (broadcast over H, W)
+            x = x * self.weight.view(1, -1, 1, 1) + self.bias.view(1, -1, 1, 1)
+        
+        return x
+
+
 class FourierUnit(nn.Module):
     """
     Core Fourier Transform unit.
@@ -180,16 +228,8 @@ class SFB(nn.Module):
         # Frequency branch: global features
         self.F = SpectralTransform(embed_dim)
         
-        # Normalization before fusion (prevents explosion)
-        def get_num_groups(channels, target=32):
-            if channels >= target and channels % target == 0:
-                return target
-            for g in [32, 16, 8, 4, 2, 1]:
-                if channels % g == 0:
-                    return g
-            return 1
-        
-        self.norm = nn.GroupNorm(get_num_groups(embed_dim * 2), embed_dim * 2)
+        # Normalization before fusion (LayerNorm2d for consistent statistics)
+        self.norm = LayerNorm2d(embed_dim * 2)
         
         # Fusion: combine spatial and frequency features
         self.fusion = nn.Conv2d(embed_dim * 2, embed_dim, kernel_size=1)
@@ -313,18 +353,9 @@ class FIRResBlock(nn.Module):
         self.num_swin_blocks = num_swin_blocks
         self.num_sfb_blocks = num_sfb_blocks
         
-        # Helper function for flexible GroupNorm
-        def get_num_groups(channels, target=32):
-            """Get a valid number of groups for GroupNorm."""
-            if channels >= target and channels % target == 0:
-                return target
-            for g in [32, 16, 8, 4, 2, 1]:
-                if channels % g == 0:
-                    return g
-            return 1
-        
         # === Stage 1: Conv + FiLM (radius conditioning BEFORE attention) ===
-        self.norm1 = nn.GroupNorm(get_num_groups(in_channels), in_channels)
+        # Use LayerNorm2d for consistent normalization statistics
+        self.norm1 = LayerNorm2d(in_channels)
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         
         # Radius conditioning via FiLM (scale and shift)
