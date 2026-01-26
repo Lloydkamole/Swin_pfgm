@@ -158,7 +158,11 @@ class EMA:
 
 config = {
     # Data Settings
+<<<<<<< HEAD
     "data_dir": "/mnt/nvme/lloyd/DL project CT-MRI/pfgm_train_brain",
+=======
+    "data_dir": "/home/lloyd/Documents/AR PFGM/pfgm_train_brain",
+>>>>>>> 650512a5545d8cec4fe4a7b024a92c21619f2cf7
     "mr_pattern": "mr.nii", # Suffix pattern to match MRI files
     "ct_pattern": "ct.nii", # Suffix pattern to match CT files
     "train_split": 0.9,
@@ -178,15 +182,25 @@ config = {
     "num_sfb_blocks": 1,   # Number of SFB blocks per FIRResBlock (sequential after Swin)
     "num_bottleneck_blocks": 4,  # Number of residual blocks in the bottleneck
     "use_sfb": True,  # Use Spatial-Frequency Blocks
+<<<<<<< HEAD
     "dropout": 0.025,
     "drop_path": 0.025,
+=======
+    "dropout": 0.0,
+    "drop_path": 0.0,
+>>>>>>> 650512a5545d8cec4fe4a7b024a92c21619f2cf7
     
     # EDM Parameters
     "sigma_min": 0.002,
     "sigma_max": 80.0,
     "sigma_data": 1.0, # 0.5 for [-1,1] normalized data, 1.0 for z-normalized
+<<<<<<< HEAD
     "P_mean": 0.0, #changed for pfgm++
     "P_std": 1.5,   # changed for pfgm++
+=======
+    "P_mean": -1.2,
+    "P_std": 1.2,
+>>>>>>> 650512a5545d8cec4fe4a7b024a92c21619f2cf7
     "rho": 7.0,
     "loss_type": "l2",
     
@@ -703,6 +717,7 @@ def compute_masked_metrics(
     return metrics
 
 
+<<<<<<< HEAD
 def apply_cfg_plus_plus(denoised_cond: torch.Tensor, denoised_uncond: torch.Tensor, 
                          cfg_scale: float, rescale_factor: float = 0.7) -> torch.Tensor:
     """
@@ -738,6 +753,8 @@ def apply_cfg_plus_plus(denoised_cond: torch.Tensor, denoised_uncond: torch.Tens
     return denoised_cfg
 
 
+=======
+>>>>>>> 650512a5545d8cec4fe4a7b024a92c21619f2cf7
 @torch.no_grad()
 def edm_sample(
     model: nn.Module,
