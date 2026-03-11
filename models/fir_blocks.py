@@ -15,6 +15,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from typing import Optional, Tuple
 
 from .swin_attention import SwinTransformerBlock
@@ -326,6 +327,8 @@ class FIRResBlock(nn.Module):
         dropout: Dropout rate.
         num_swin_blocks: Number of Swin blocks (W-MSA + SW-MSA pattern).
         num_sfb_blocks: Number of SFB blocks applied after Swin.
+        gradient_checkpoint: Enable gradient checkpointing for Swin/SFB blocks
+            to trade ~30% speed for ~60% activation memory savings.
     """
     
     def __init__(
@@ -343,6 +346,7 @@ class FIRResBlock(nn.Module):
         dropout: float = 0.0,
         num_swin_blocks: int = 2,
         num_sfb_blocks: int = 1,
+        gradient_checkpoint: bool = False,
     ):
         super().__init__()
         
@@ -352,6 +356,7 @@ class FIRResBlock(nn.Module):
         self.use_sfb = use_sfb
         self.num_swin_blocks = num_swin_blocks
         self.num_sfb_blocks = num_sfb_blocks
+        self.use_gradient_checkpoint = gradient_checkpoint
         
         # === Stage 1: Conv + FiLM (radius conditioning BEFORE attention) ===
         # Use LayerNorm2d for consistent normalization statistics
@@ -438,14 +443,20 @@ class FIRResBlock(nn.Module):
         shift = shift[:, :, None, None]
         h = h * (1 + scale) + shift
         
-        # === Stage 2: Swin Attention (sequential) ===
+        # === Stage 2: Swin Attention (sequential, with gradient checkpointing) ===
         if self.swin_blocks is not None:
             # Reshape for Swin: [B, C, H, W] -> [B, H*W, C]
             h_flat = h.flatten(2).transpose(1, 2)
             current_size = x_size if x_size is not None else (H, W)
             
             for swin_block in self.swin_blocks:
-                h_flat = swin_block(h_flat, current_size)
+                if self.training and self.use_gradient_checkpoint:
+                    h_flat = grad_checkpoint(
+                        swin_block, h_flat, current_size,
+                        use_reentrant=False,
+                    )
+                else:
+                    h_flat = swin_block(h_flat, current_size)
             
             # Reshape back: [B, H*W, C] -> [B, C, H, W]
             h = h_flat.transpose(1, 2).view(B, -1, H, W)
@@ -453,10 +464,16 @@ class FIRResBlock(nn.Module):
         # === Stage 3: SFB Blocks (sequential, AFTER Swin) ===
         if self.sfb_blocks is not None:
             for sfb_block in self.sfb_blocks:
-                h = sfb_block(h)
+                if self.training and self.use_gradient_checkpoint:
+                    h = grad_checkpoint(
+                        sfb_block, h,
+                        use_reentrant=False,
+                    )
+                else:
+                    h = sfb_block(h)
         
-        # === Residual connection: processed + identity ===
-        return self.residual_scale * (h + identity)
+        # === Residual connection: scale only the learned branch ===
+        return identity + self.residual_scale * h
 
 
 class Downsample(nn.Module):

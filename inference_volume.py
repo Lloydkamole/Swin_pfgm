@@ -77,35 +77,35 @@ config = {
     "mode": "single",  # "single" or "directory"
     
     # Checkpoint
-    "checkpoint": "./outputs_accelerate/20260112_000305_pfgm_fir/checkpoints/best",
+    "checkpoint": "/mnt/nvme/lloyd/Swin-pfgm/Swin_pfgm/outputs_accelerate/20260210_152458_pfgm_fir/checkpoints/best",
     
     # Single file mode (used when mode="single")
     # "input_mri": "/mnt/nvme/lloyd/DL project CT-MRI/pfgm_test_brain/1BA336/mr.nii_processed_patch.nii.gz",  # CHANGE THIS
     # "output_ct": "/mnt/nvme/lloyd/DL project CT-MRI/pfgm_test_brain/1BA336/generated_ct.nii.gz",
     
     # Directory mode (used when mode="directory")
-    "input_dir": "/mnt/nvme/lloyd/DL project CT-MRI/pfgm_train_brain",
+    "input_dir": "/mnt/nvme/lloyd/DL project CT-MRI/pfgm_train_brain_new",
     "output_dir": "./inference_output",
     "pattern": "mr.nii",  # Filename pattern to match MRI files
     
     # Model Architecture (must match training config)
-    "base_channels": 128,
-    "channel_mults": [1, 2, 4, 8],
+    "base_channels": 64,
+    "channel_mults": [1, 2, 4, 4],
     "num_res_blocks": 1,
-    "attention_resolutions": [],
-    "num_heads": 8,
+    "attention_resolutions": [4],
+    "num_heads": 4,
     "mlp_ratio": 4.0,
     "radius_emb_dim": 256,
-    "window_size": 4,
-    "num_swin_blocks": 4,
+    "window_size": 8,
+    "num_swin_blocks": 6,
     "num_sfb_blocks": 1,
-    "num_bottleneck_blocks": 4,
+    "num_bottleneck_blocks": 2,
     "use_sfb": True,
     "dropout": 0.0,
     "drop_path": 0.0,
     
     # Sampling Parameters
-    "num_steps": 50,
+    "num_steps": 100,
     "cfg_scale": 2.0,
     "sigma_min": 0.002,
     "sigma_max": 80.0,
@@ -118,14 +118,18 @@ config = {
     "use_cfg_plus_plus": True,  # Use CFG++ manifold constraints
     "cfg_rescale_factor": 0.7,  # Rescale factor for CFG++ (0.0 = no rescale, 1.0 = full rescale)
     "use_dynamic_cfg": True,  # Use dynamic CFG scaling
-    "cfg_scale_min": 1.0,  # Minimum CFG scale (at end of sampling)
-    "cfg_scale_max": 3.0,  # Maximum CFG scale (at start of sampling)
+    "cfg_scale_min": 2.0,  # Minimum CFG scale (at end of sampling)
+    "cfg_scale_max": 4.0,  # Maximum CFG scale (at start of sampling)
     
     # Processing Parameters
     "image_size": 256,
-    "batch_size": 40,  # Number of slices to process at once
-    "device": "cuda:1",  # None for auto-detect, or "cuda" / "cpu"
+    "batch_size": 30,  # Number of slices to process at once
+    "device": "cuda:0",  # None for auto-detect, or "cuda" / "cpu"
     "seed": 42,  # Random seed for reproducibility
+    
+    # Test-Time Augmentation (TTA)
+    "use_tta": False,              # Enable Flip TTA (averages predictions over flipped inputs)
+    "tta_flips": ["lr", "ud", "lr_ud"],  # Which flips to use: "lr" (left-right), "ud" (up-down), "lr_ud" (both)
 }
 
 
@@ -220,6 +224,59 @@ def apply_cfg_plus_plus(denoised_cond: torch.Tensor, denoised_uncond: torch.Tens
         denoised_cfg = rescale_factor * (denoised_cfg * rescale) + (1 - rescale_factor) * denoised_cfg
     
     return denoised_cfg
+
+
+def _flip_tensor(x: torch.Tensor, flip_type: str) -> torch.Tensor:
+    """Flip a [B, C, H, W] tensor."""
+    if flip_type == "lr":
+        return torch.flip(x, dims=[-1])       # left-right (flip W)
+    elif flip_type == "ud":
+        return torch.flip(x, dims=[-2])       # up-down (flip H)
+    elif flip_type == "lr_ud":
+        return torch.flip(x, dims=[-2, -1])   # both
+    else:
+        raise ValueError(f"Unknown flip type: {flip_type}")
+
+
+@torch.no_grad()
+def edm_sample_tta(
+    model: nn.Module,
+    mri: torch.Tensor,
+    tta_flips: list = ("lr", "ud", "lr_ud"),
+    **sample_kwargs,
+) -> torch.Tensor:
+    """
+    Flip Test-Time Augmentation wrapper around edm_sample.
+    
+    Runs the sampler on the original input + each flipped version,
+    flips predictions back to the original orientation, then averages
+    all predictions. This reduces noise and improves consistency.
+    
+    Args:
+        model: Denoising model
+        mri: Conditioning MRI images [B, 1, H, W]
+        tta_flips: List of flip types to use. Any combination of:
+                   "lr" (left-right), "ud" (up-down), "lr_ud" (both)
+        **sample_kwargs: All other arguments forwarded to edm_sample()
+    
+    Returns:
+        Averaged CT prediction [B, 1, H, W]
+    """
+    # 1) Original (unflipped) prediction
+    pred_original = edm_sample(model, mri, **sample_kwargs)
+    preds = [pred_original]
+    
+    # 2) Flipped predictions
+    for flip_type in tta_flips:
+        mri_flipped = _flip_tensor(mri, flip_type)
+        pred_flipped = edm_sample(model, mri_flipped, **sample_kwargs)
+        # Flip prediction back to original orientation
+        pred_unflipped = _flip_tensor(pred_flipped, flip_type)
+        preds.append(pred_unflipped)
+    
+    # 3) Average all predictions
+    pred_avg = torch.stack(preds, dim=0).mean(dim=0)
+    return pred_avg
 
 
 @torch.no_grad()
@@ -635,10 +692,8 @@ def process_volume(
             
             mri_batch = mri_batch.to(device)
             
-            # Generate CT slices
-            ct_batch = edm_sample(
-                model=model,
-                mri=mri_batch,
+            # Shared sampling kwargs
+            sample_kwargs = dict(
                 num_steps=cfg["num_steps"],
                 sigma_min=cfg["sigma_min"],
                 sigma_max=cfg["sigma_max"],
@@ -647,7 +702,6 @@ def process_volume(
                 cfg_scale=cfg["cfg_scale"],
                 pfgmpp=cfg["pfgmpp"],
                 D=cfg["D"],
-                # CFG++ and Dynamic Scaling
                 use_cfg_plus_plus=cfg.get("use_cfg_plus_plus", False),
                 cfg_rescale_factor=cfg.get("cfg_rescale_factor", 0.7),
                 use_dynamic_cfg=cfg.get("use_dynamic_cfg", False),
@@ -655,8 +709,23 @@ def process_volume(
                 cfg_scale_max=cfg.get("cfg_scale_max", 3.0),
             )
             
+            # Generate CT slices (with optional Flip TTA)
+            if cfg.get("use_tta", False):
+                ct_batch = edm_sample_tta(
+                    model=model,
+                    mri=mri_batch,
+                    tta_flips=cfg.get("tta_flips", ["lr", "ud", "lr_ud"]),
+                    **sample_kwargs,
+                )
+            else:
+                ct_batch = edm_sample(
+                    model=model,
+                    mri=mri_batch,
+                    **sample_kwargs,
+                )
+            
             # Clamp output to reasonable range (matches training)
-            ct_batch = torch.clamp(ct_batch, -3.0, 3.0)
+            ct_batch = torch.clamp(ct_batch, -1, 1)
             
             # Convert back to numpy and store
             ct_batch = ct_batch.cpu().numpy()  # [B, 1, H, W]
@@ -769,6 +838,7 @@ def main():
     print(f"CFG scale: {cfg['cfg_scale']}")
     print(f"CFG++: {cfg.get('use_cfg_plus_plus', False)} (rescale={cfg.get('cfg_rescale_factor', 0.7)})")
     print(f"Dynamic CFG: {cfg.get('use_dynamic_cfg', False)} (max={cfg.get('cfg_scale_max', 3.0)} → min={cfg.get('cfg_scale_min', 1.0)})")
+    print(f"Flip TTA: {cfg.get('use_tta', False)} (flips={cfg.get('tta_flips', [])})")
     print(f"PFGMPP: {cfg['pfgmpp']}")
     print(f"Image size: {cfg['image_size']}")
     print(f"Batch size: {cfg['batch_size']}")
@@ -816,8 +886,8 @@ def main():
 
 
 if __name__ == "__main__":
-    for k in ["1BB184", "1BC085", "1BC086"]:
+    for k in ["1BA336", "1BA345", "1BB182", "1BB184", "1BC085", "1BC086", "1HNA133", "1HNC124"]:
         print(f"Processing subject: {k}")
-        config["input_mri"] = f"/mnt/nvme/lloyd/DL project CT-MRI/pfgm_test_brain/{k}/mr.nii_processed_patch.nii.gz"
-        config["output_ct"] = f"/mnt/nvme/lloyd/DL project CT-MRI/pfgm_test_brain/{k}/generated_ct.nii.gz"
+        config["input_mri"] = f"/mnt/nvme/lloyd/DL project CT-MRI/pfgm_test_brain_new/{k}/mr.nii_processed_patch.nii.gz"
+        config["output_ct"] = f"/mnt/nvme/lloyd/DL project CT-MRI/pfgm_test_brain_new/{k}/generated_ct.nii.gz"
         main()

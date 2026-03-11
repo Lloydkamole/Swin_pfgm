@@ -14,6 +14,7 @@ Usage:
     accelerate launch --config_file accelerate_config.yaml train_accelerate.py
 """
 
+import gc
 import os
 import sys
 import math
@@ -158,11 +159,7 @@ class EMA:
 
 config = {
     # Data Settings
-<<<<<<< HEAD
-    "data_dir": "/mnt/nvme/lloyd/DL project CT-MRI/pfgm_train_brain",
-=======
-    "data_dir": "/home/lloyd/Documents/AR PFGM/pfgm_train_brain",
->>>>>>> 650512a5545d8cec4fe4a7b024a92c21619f2cf7
+    "data_dir": "/mnt/nvme/lloyd/DL project CT-MRI/pfgm_train_brain_new",
     "mr_pattern": "mr.nii", # Suffix pattern to match MRI files
     "ct_pattern": "ct.nii", # Suffix pattern to match CT files
     "train_split": 0.9,
@@ -171,36 +168,27 @@ config = {
     # Model Architecture
     "model_config": "custom", # "custom" or predefined config name
     "base_channels": 64,   # Reduced from 128 for memory
-    "channel_mults": [1, 2, 4, 8],
-    "num_res_blocks": 1,  # Number of times the Swin+SFB block repeats per encoder/decoder stage
-    "attention_resolutions": [],  # Reduced: only use attention at lower resolutions
+    "channel_mults": [1, 2, 4, 8],  # 4 stages: optimal for 256x256 (64→128→256→512 ch)
+    "num_res_blocks": 2,  # Number of times the Swin+SFB block repeats per encoder/decoder stage
+    "attention_resolutions": [2, 4, 8],  # Enable attention at 256ch and 512ch stages (critical!)
     "num_heads": 8,
     "mlp_ratio": 4.0, # MLP expansion ratio in transformer blocks
     "radius_emb_dim": 256,
-    "window_size": 4, # Swin Transformer window size
-    "num_swin_blocks": 4,  # Number of Swin attention blocks per FIRResBlock (W-MSA + SW-MSA pattern)
+    "window_size": 8, # Swin Transformer window size
+    "num_swin_blocks": 6,  # Number of Swin attention blocks per FIRResBlock (W-MSA + SW-MSA pattern)
     "num_sfb_blocks": 1,   # Number of SFB blocks per FIRResBlock (sequential after Swin)
-    "num_bottleneck_blocks": 4,  # Number of residual blocks in the bottleneck
+    "num_bottleneck_blocks": 2,  # Number of residual blocks in the bottleneck
     "use_sfb": True,  # Use Spatial-Frequency Blocks
-<<<<<<< HEAD
-    "dropout": 0.025,
-    "drop_path": 0.025,
-=======
-    "dropout": 0.0,
+    "dropout": 0.05,
     "drop_path": 0.0,
->>>>>>> 650512a5545d8cec4fe4a7b024a92c21619f2cf7
+    "gradient_checkpoint": True,  # Trade ~30% speed for ~60% activation memory savings
     
     # EDM Parameters
-    "sigma_min": 0.002,
+    "sigma_min": 0.01,
     "sigma_max": 80.0,
-    "sigma_data": 1.0, # 0.5 for [-1,1] normalized data, 1.0 for z-normalized
-<<<<<<< HEAD
-    "P_mean": 0.0, #changed for pfgm++
-    "P_std": 1.5,   # changed for pfgm++
-=======
-    "P_mean": -1.2,
-    "P_std": 1.2,
->>>>>>> 650512a5545d8cec4fe4a7b024a92c21619f2cf7
+    "sigma_data": 0.45, # 0.5 for [-1,1] normalized data, 1.0 for z-normalized
+    "P_mean": -0.8, #changed for pfgm++
+    "P_std": 1,   # changed for pfgm++
     "rho": 7.0,
     "loss_type": "l2",
     
@@ -209,7 +197,7 @@ config = {
     "D": 128,                            # Augmented dimension for PFGM++ (D→∞ recovers EDM)
       
     # Classifier-Free Guidance (CFG)
-    "cond_drop_prob": 0.2,               # Probability of dropping MRI conditioning (0.0 = no CFG)
+    "cond_drop_prob": 0.1,               # Probability of dropping MRI conditioning (0.0 = no CFG)
     "cfg_scale": 2.0,                    # Guidance scale at inference (1.0 = no guidance)
     
     # CFG++ and Dynamic Scaling (for sampling/generation)
@@ -225,27 +213,27 @@ config = {
     "mask_threshold": 0.0,              # Threshold for body mask in z-normalized range (adjust based on data)
     
     # Body Mask Training (nnsyn-style anatomically-focused training)
-    "use_body_mask": False,              # Enable body mask loading and masked training
+    "use_body_mask": True,              # Enable body mask loading and masked training
     "mask_pattern": "mask.nii",          # Suffix pattern to match mask files
     "mask_outside_value": -1.0,          # Value to use for regions outside the mask in generated images
     
     # Training Parameters
     "num_epochs": 150,
-    "batch_size": 10,  # Per GPU batch size (reduced for memory)
-    "lr": 1e-4,
+    "batch_size": 15,  # Per GPU batch size (reduced for memory)
+    "lr": 1e-3,
     "weight_decay": 0.01,
     "grad_clip": None,  # Enable gradient clipping
     "warmup_steps": 200,
     
     # Sampling / Generation
-    "num_sample_steps": 50,
+    "num_sample_steps": 25,
     "num_val_samples": 3,
     
     # Logging & Checkpointing
     "output_dir": "./outputs_accelerate",
     "log_every": 5,
     "val_every": 1,
-    "save_every": 10,
+    "save_every": 20,
     "sample_every": 1,
     "resume": None,
     
@@ -256,13 +244,17 @@ config = {
     
     # System
     "seed": 42,
-    "num_workers": 4,
-    "mixed_precision": "no",  # "no", "fp16", or "bf16"
+    "num_workers": 12,
+    "mixed_precision": "bf16",  # "no", "fp16", or "bf16"
     
     # EMA (Exponential Moving Average)
     "use_ema": True,                     # Enable EMA for smoother weights
     "ema_decay": 0.9999,                 # EMA decay rate (higher = slower update)
     "ema_update_every": 1,               # Update EMA every N steps
+    
+    # Test-Time Augmentation (TTA) for validation generation
+    "use_tta": False,                    # Enable Flip TTA during val generation (4x slower)
+    "tta_flips": ["lr", "ud", "lr_ud"], # Which flips: "lr", "ud", "lr_ud"
 }
 
 
@@ -717,7 +709,6 @@ def compute_masked_metrics(
     return metrics
 
 
-<<<<<<< HEAD
 def apply_cfg_plus_plus(denoised_cond: torch.Tensor, denoised_uncond: torch.Tensor, 
                          cfg_scale: float, rescale_factor: float = 0.7) -> torch.Tensor:
     """
@@ -753,8 +744,63 @@ def apply_cfg_plus_plus(denoised_cond: torch.Tensor, denoised_uncond: torch.Tens
     return denoised_cfg
 
 
-=======
->>>>>>> 650512a5545d8cec4fe4a7b024a92c21619f2cf7
+def _flip_tensor(x: torch.Tensor, flip_type: str) -> torch.Tensor:
+    """Flip a [B, C, H, W] tensor."""
+    if flip_type == "lr":
+        return torch.flip(x, dims=[-1])       # left-right (flip W)
+    elif flip_type == "ud":
+        return torch.flip(x, dims=[-2])       # up-down (flip H)
+    elif flip_type == "lr_ud":
+        return torch.flip(x, dims=[-2, -1])   # both
+    else:
+        raise ValueError(f"Unknown flip type: {flip_type}")
+
+
+@torch.no_grad()
+def edm_sample_tta(
+    model: nn.Module,
+    mri: torch.Tensor,
+    tta_flips: list = ("lr", "ud", "lr_ud"),
+    **sample_kwargs,
+) -> torch.Tensor:
+    """
+    Flip Test-Time Augmentation wrapper around edm_sample.
+    
+    Runs the sampler on the original input + each flipped version,
+    flips predictions back to the original orientation, then averages
+    all predictions. This reduces noise and improves metric consistency.
+    
+    Args:
+        model: Denoising model
+        mri: Conditioning MRI images [B, 1, H, W]
+        tta_flips: List of flip types: "lr", "ud", "lr_ud"
+        **sample_kwargs: All other arguments forwarded to edm_sample()
+    
+    Returns:
+        Averaged CT prediction [B, 1, H, W]
+    """
+    # Remove return_trajectory_stats for TTA (only use stats from original)
+    sample_kwargs_no_stats = {k: v for k, v in sample_kwargs.items()
+                              if k != 'return_trajectory_stats'}
+    sample_kwargs_no_stats['return_trajectory_stats'] = False
+    
+    # 1) Original (unflipped) prediction
+    pred_original = edm_sample(model, mri, **sample_kwargs_no_stats)
+    preds = [pred_original]
+    
+    # 2) Flipped predictions
+    for flip_type in tta_flips:
+        mri_flipped = _flip_tensor(mri, flip_type)
+        pred_flipped = edm_sample(model, mri_flipped, **sample_kwargs_no_stats)
+        # Flip prediction back to original orientation
+        pred_unflipped = _flip_tensor(pred_flipped, flip_type)
+        preds.append(pred_unflipped)
+    
+    # 3) Average all predictions
+    pred_avg = torch.stack(preds, dim=0).mean(dim=0)
+    return pred_avg
+
+
 @torch.no_grad()
 def edm_sample(
     model: nn.Module,
@@ -973,6 +1019,7 @@ def train(cfg: dict):
             use_sfb=cfg["use_sfb"],
             dropout=cfg["dropout"],
             drop_path_rate=cfg["drop_path"],
+            gradient_checkpoint=cfg.get("gradient_checkpoint", False),
         )
     else:
         model = create_swin_fir_unet(
@@ -1035,7 +1082,7 @@ def train(cfg: dict):
             print(f"Body mask training ENABLED - using mask pattern: {mask_pattern}")
         print("Creating datasets...")
     
-    train_transforms = get_monai_nifti_transforms(mode="train", target_size=cfg["image_size"])
+    train_transforms = get_monai_nifti_transforms(mode="train", target_size=cfg["image_size"], use_body_mask=use_body_mask)
     train_dataset = MonaiNiftiSliceDataset(
         data=train_files,
         transform=train_transforms,
@@ -1060,7 +1107,7 @@ def train(cfg: dict):
     
     val_loader = None
     if val_files:
-        val_transforms = get_monai_nifti_transforms(mode="val", target_size=cfg["image_size"])
+        val_transforms = get_monai_nifti_transforms(mode="val", target_size=cfg["image_size"], use_body_mask=use_body_mask)
         val_dataset = MonaiNiftiSliceDataset(
             data=val_files,
             transform=val_transforms,
@@ -1083,7 +1130,7 @@ def train(cfg: dict):
         if current_step < warmup_steps:
             return float(current_step) / float(max(1, warmup_steps))
         progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        # return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
         return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress))) # Decay to 1% of LR
     
     # For non-FSDP, create scheduler before prepare
@@ -1094,9 +1141,18 @@ def train(cfg: dict):
     # Prepare with Accelerate
     if accelerator.is_main_process:
         print("Preparing model and data with Accelerator...")
+        print(f"  DEBUG: is_fsdp={is_fsdp}, distributed_type={accelerator.distributed_type}")
+    
+    # Force a barrier to ensure all processes are synced
+    accelerator.wait_for_everyone()
+    
+    if accelerator.is_main_process:
+        print("  DEBUG: Starting prepare()...")
     
     if is_fsdp:
         # FSDP path: prepare model first, then create optimizer from wrapped model
+        if accelerator.is_main_process:
+            print("  DEBUG: FSDP path - preparing model...")
         model = accelerator.prepare(model)
         
         # Create optimizer after FSDP wrapping (critical for FSDP)
@@ -1111,11 +1167,15 @@ def train(cfg: dict):
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         
         # Prepare optimizer, dataloader, scheduler
+        if accelerator.is_main_process:
+            print("  DEBUG: FSDP path - preparing optimizer, dataloader, scheduler...")
         optimizer, train_loader, scheduler = accelerator.prepare(
             optimizer, train_loader, scheduler
         )
     else:
         # Standard path: prepare everything together
+        if accelerator.is_main_process:
+            print("  DEBUG: Standard path - preparing all...")
         model, optimizer, train_loader, scheduler = accelerator.prepare(
             model, optimizer, train_loader, scheduler
         )
@@ -1286,6 +1346,11 @@ def train(cfg: dict):
         if (epoch + 1) % cfg["sample_every"] == 0:
             model.eval()
             
+            # Free GPU memory before sampling to prevent OOM
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
             # All ranks must participate in DataLoader iteration to avoid NCCL timeout
             sample_batch = next(iter(train_loader))
             mr_samples = sample_batch["mr"][:cfg["num_val_samples"]]
@@ -1353,9 +1418,9 @@ def train(cfg: dict):
                             cfg_scale_max=cfg.get("cfg_scale_max", 3.0),
                         )
                     
-                    pred_ct = torch.clamp(pred_ct, -3.0, 3.0)
-                    pred_ct_01 = (pred_ct + 3.0) / 6.0
-                    ct_samples_01 = (ct_samples + 3.0) / 6.0
+                    #pred_ct = torch.clamp(pred_ct, -3.0, 6.0)
+                    pred_ct_01 = (pred_ct + 1.0) / 2.0
+                    ct_samples_01 = (ct_samples + 1.0) / 2.0
                     
                     # Prepare mask for metrics (scale to [0,1] range)
                     mask_for_metrics = None
@@ -1398,6 +1463,15 @@ def train(cfg: dict):
                     # Restore original weights after EMA sampling
                     if ema is not None:
                         ema.restore()
+            
+            # Free sampling memory before resuming training
+            del sample_batch, mr_samples, ct_samples
+            if sample_mask is not None:
+                del sample_mask
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
             model.train()
         
         # Validation
@@ -1445,6 +1519,11 @@ def train(cfg: dict):
                 if accelerator.is_main_process:
                     print(f"  New best model saved!")
             
+            # Free validation loss memory before generation
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
             # Validation sample generation
             # All ranks must participate in DataLoader iteration to avoid NCCL timeout
             val_sample_batch = next(iter(val_loader))
@@ -1464,8 +1543,7 @@ def train(cfg: dict):
                     ema.apply_shadow()
                 
                 # Generate samples from validation MRI
-                pred_val_ct = edm_sample(
-                    unwrapped_model, mr_val_samples,
+                val_sample_kwargs = dict(
                     num_steps=cfg["num_sample_steps"],
                     sigma_min=cfg["sigma_min"],
                     sigma_max=cfg["sigma_max"],
@@ -1474,7 +1552,6 @@ def train(cfg: dict):
                     cfg_scale=cfg.get("cfg_scale", 1.0),
                     pfgmpp=cfg.get("pfgmpp", False),
                     D=cfg.get("D", 128),
-                    # CFG++ and Dynamic Scaling
                     use_cfg_plus_plus=cfg.get("use_cfg_plus_plus", False),
                     cfg_rescale_factor=cfg.get("cfg_rescale_factor", 0.7),
                     use_dynamic_cfg=cfg.get("use_dynamic_cfg", False),
@@ -1482,9 +1559,21 @@ def train(cfg: dict):
                     cfg_scale_max=cfg.get("cfg_scale_max", 3.0),
                 )
                 
-                pred_val_ct = torch.clamp(pred_val_ct, -3.0, 3.0)
-                pred_val_ct_01 = (pred_val_ct + 3.0) / 6.0
-                ct_val_samples_01 = (ct_val_samples + 3.0) / 6.0
+                if cfg.get("use_tta", False):
+                    pred_val_ct = edm_sample_tta(
+                        unwrapped_model, mr_val_samples,
+                        tta_flips=cfg.get("tta_flips", ["lr", "ud", "lr_ud"]),
+                        **val_sample_kwargs,
+                    )
+                else:
+                    pred_val_ct = edm_sample(
+                        unwrapped_model, mr_val_samples,
+                        **val_sample_kwargs,
+                    )
+                
+                #pred_val_ct = torch.clamp(pred_val_ct, -3.0, 6.0)
+                pred_val_ct_01 = (pred_val_ct + 1.0) / 2.0
+                ct_val_samples_01 = (ct_val_samples + 1.0) / 2.0
                 
                 # Prepare mask for validation metrics
                 val_mask_for_metrics = None
@@ -1527,6 +1616,14 @@ def train(cfg: dict):
                 # Restore original weights after EMA sampling
                 if ema is not None:
                     ema.restore()
+            
+            # Free validation generation memory
+            del val_sample_batch, mr_val_samples, ct_val_samples
+            if val_sample_mask is not None:
+                del val_sample_mask
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             model.train()
         

@@ -69,6 +69,7 @@ class SwinFIRUNet(nn.Module):
         use_sfb: Whether to use SFB (Spatial-Frequency Block).
         dropout: Dropout rate.
         drop_path_rate: Stochastic depth rate.
+        gradient_checkpoint: Enable gradient checkpointing for Swin/SFB blocks.
     """
     
     def __init__(
@@ -89,6 +90,7 @@ class SwinFIRUNet(nn.Module):
         use_sfb: bool = True,
         dropout: float = 0.0,
         drop_path_rate: float = 0.1,
+        gradient_checkpoint: bool = False,
     ):
         super().__init__()
         
@@ -100,6 +102,7 @@ class SwinFIRUNet(nn.Module):
         self.window_size = window_size
         self.num_sfb_blocks = num_sfb_blocks
         self.num_bottleneck_blocks = num_bottleneck_blocks
+        self.gradient_checkpoint = gradient_checkpoint
         
         # Calculate stochastic depth rates
         num_stages = len(channel_mults)
@@ -143,6 +146,7 @@ class SwinFIRUNet(nn.Module):
                         num_sfb_blocks=num_sfb_blocks,
                         drop_path=dpr[block_idx],
                         dropout=dropout,
+                        gradient_checkpoint=gradient_checkpoint,
                     )
                 )
                 current_channels = out_ch
@@ -169,6 +173,7 @@ class SwinFIRUNet(nn.Module):
                 num_sfb_blocks=num_sfb_blocks,
                 drop_path=drop_path_rate,
                 dropout=dropout,
+                gradient_checkpoint=gradient_checkpoint,
             )
             for _ in range(num_bottleneck_blocks)
         ])
@@ -210,6 +215,7 @@ class SwinFIRUNet(nn.Module):
                         num_sfb_blocks=num_sfb_blocks,
                         drop_path=dpr[block_idx % len(dpr)],
                         dropout=dropout,
+                        gradient_checkpoint=gradient_checkpoint,
                     )
                 )
                 block_idx += 1
