@@ -1,30 +1,156 @@
-# Ignore outputs directories created by training
+# =============================================================================
+# Training outputs (generated at runtime — never commit)
+# =============================================================================
 /outputs/
 /outputs_accelerate/
 /outputs_accelerate_v2/
+/outputs_accelerate_medsam/
 /outputs_mp_accelerate/
 /outputs_accelerate_25d/
+/inference_output/
 /divers/
 /evaluation_results/
 /docs/
 
-# Python
+# =============================================================================
+# Python artefacts
+# =============================================================================
 *.py[cod]
 *.so
 *.egg-info/
+__pycache__/
 venv/
 env/
 ENV/
 .env
 .env.*
 
+# =============================================================================
 # Jupyter
+# =============================================================================
 .ipynb_checkpoints/
 
-# VSCode
-.vscode/
+# Exploratory / analysis notebooks (not needed to run training)
+sampling_steps_analysis.ipynb
+visualize_attention.ipynb
+visualize_deformable_attention.ipynb
+visualize_loader.ipynb
 
-# OS
+# =============================================================================
+# IDEs & OS
+# =============================================================================
+.vscode/
 .DS_Store
+
+# =============================================================================
+# Diagnostic & profiling scripts (not needed to run training)
+# =============================================================================
+check_fsdp_status.py
+diagnose_training_25d.py
+profile_compile.py
+profile_gradckpt.py
+profile_training.py
+test_pfgmpp.py
+
+# Diagnostic output files
+diagnostic_full.txt
+diagnostic_output.txt
+
+# =============================================================================
+# Figure-generation scripts (regenerate with generate_*.py if needed)
+# =============================================================================
+generate_architecture_diagram.py
+generate_pipeline_figure.py
+generate_pipeline_pptx.py
+generate_pipeline_v2.py
+generate_presentation.py
+generate_swin_fir_slides.py
+generate_timeline.py
+
+# =============================================================================
+# Generated figures, slides & presentations
+# =============================================================================
+figure_*.pdf
+figure_*.png
+figure_*.pptx
+metrics_vs_steps.png
+quality_vs_time.png
+qualifying_exam_presentation.pptx
+
+# =============================================================================
+# Research writing / LaTeX (not part of the codebase)
+# =============================================================================
+research_strat.md
+rstrategy.tex
+traincan.tex
+
+# =============================================================================
+# Old / backup trainer scripts (superseded by the three canonical trainers)
+# =============================================================================
+train_accelerate_25d_backup.py
+train_accelerate_v2.py
+train_lightning_fsdp.py
+train_mp_accelerate.py
+train_pfgm_fir.py
+*.bak
+
+# =============================================================================
+# Old / unused model files (only imported by the old trainers above)
+# =============================================================================
+models/fir_blocks_v2.py
+models/mp_fir_blocks.py
+models/mp_layers.py
+models/mp_network.py
+models/network_v2.py
+
+# =============================================================================
+# Old loader (superseded by loader.py / loader_medsam.py / loader_25d.py)
+# =============================================================================
+loader2.py
+
+# =============================================================================
+# Model checkpoints & weights (never commit — too large)
+# =============================================================================
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+
+# =============================================================================
+# Medical-imaging / tensor data (huge — datasets live outside the repo)
+# =============================================================================
+*.nii
+*.nii.gz
+*.mha
+*.mhd
+*.dcm
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# =============================================================================
+# Training logs & experiment tracking
+# =============================================================================
+*.log
+wandb/
+runs/
+lightning_logs/
+tb_logs/
+tensorboard/
+mlruns/
+
+# =============================================================================
+# Test / lint / type-check caches
+# =============================================================================
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
 
 

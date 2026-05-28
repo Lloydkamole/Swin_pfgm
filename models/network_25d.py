@@ -1,47 +1,36 @@
 """
-2.5D SwinFIR UNet for PFGM++ with 3D Convolutions.
+2.5D SwinFIR UNet for PFGM++ with 3D Convolutions — FIR architecture.
 
-Adapted from 2D network.py to handle small volumetric inputs.
-Uses 3D convolutions throughout while maintaining the SwinFIR architecture.
+Volumetric counterpart to `network.py`. Mirrors the 2D `FIRResBlock` structure
+on 5D tensors [B, C, D, H, W]:
 
-Architecture:
-    Input: [noisy_CT, MRI] concatenated (2 channels, D slices)
-    Shape: [B, 2, D, H, W]
-    ↓
-    Initial Conv3D → embed_dim
-    ↓
-    Encoder stages (with 3D downsampling):
-    - 3D convolutions with PFGM++ radius conditioning
-    - 3D Downsample at each stage
-    ↓
-    Bottleneck:
-    - 3D residual blocks
-    ↓
-    Decoder stages (with 3D upsampling):
-    - 3D Upsample
-    - Concatenate with skip connection
-    - 3D residual blocks
-    ↓
-    Final Conv3D → output_channels
-    ↓
-    Output: Predicted vector field (1 channel, D slices)
-    Shape: [B, 1, D, H, W]
+    input → AdaGN+Conv (radius-conditioned) → attention blocks
+          → SFB3D blocks (FFT global receptive field) → residual
 
-Note: For simplicity, we use 3D convolutions without Swin attention
-(which would require significant adaptation for 3D). We keep the
-radius conditioning and multi-scale UNet structure.
+Two attention paths (selectable via `attention_type`):
+    - 'window'     : SwinTransformerBlock3D (existing)
+    - 'deformable' : AdaLNZeroDeformableBlock3D (new, 3D DAT++ with QK-Norm)
+
+Also supports body-mask training (`in_channels=3`-style threading) and passes
+the body mask through deformable attention to suppress background K/V.
 """
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from .embeddings import RadiusEmbedding
 from .swin_attention_3d import SwinTransformerBlock3D
+from .deformable_attention_3d import AdaLNZeroDeformableBlock3D
 
+
+# =============================================================================
+# Helpers
+# =============================================================================
 
 def get_num_groups(channels: int, num_groups: int = 32, min_channels_per_group: int = 4) -> int:
     """Calculate valid number of groups for GroupNorm."""
@@ -52,180 +41,377 @@ def get_num_groups(channels: int, num_groups: int = 32, min_channels_per_group: 
     return num_groups
 
 
-class ResBlock3D(nn.Module):
+class LayerNorm3d(nn.Module):
+    """LayerNorm for 5D feature maps (channels-first), used in SFB3D fusion."""
+
+    def __init__(self, num_features: int, eps: float = 1e-6, elementwise_affine: bool = True):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(num_features))
+            self.bias = nn.Parameter(torch.zeros(num_features))
+        else:
+            self.register_parameter('weight', None)
+            self.register_parameter('bias', None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mean = x.mean(dim=(1, 2, 3, 4), keepdim=True)
+        var = x.var(dim=(1, 2, 3, 4), keepdim=True, unbiased=False)
+        x = (x - mean) / torch.sqrt(var + self.eps)
+        if self.elementwise_affine:
+            x = x * self.weight.view(1, -1, 1, 1, 1) + self.bias.view(1, -1, 1, 1, 1)
+        return x
+
+
+class AdaGroupNorm3D(nn.Module):
+    """Adaptive GroupNorm for 5D features (radius conditioning via FiLM)."""
+
+    def __init__(self, num_channels: int, r_emb_dim: int, num_groups: int = 32):
+        super().__init__()
+        num_groups = get_num_groups(num_channels, num_groups)
+        self.gn = nn.GroupNorm(num_groups, num_channels, affine=False)
+        self.proj = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(r_emb_dim, num_channels * 2),
+        )
+
+    def forward(self, x: torch.Tensor, r_emb: torch.Tensor) -> torch.Tensor:
+        x = self.gn(x)
+        scale, shift = self.proj(r_emb).chunk(2, dim=-1)
+        return x * (1 + scale[:, :, None, None, None]) + shift[:, :, None, None, None]
+
+
+# =============================================================================
+# 3D SFB (Spatial-Frequency Block)
+# =============================================================================
+
+class FourierUnit3D(nn.Module):
+    """3D FFT unit: rfftn over (D, H, W), 1x1x1 conv on real+imag, irfftn."""
+
+    def __init__(self, embed_dim: int, fft_norm: str = 'ortho'):
+        super().__init__()
+        self.conv_layer = nn.Conv3d(embed_dim * 2, embed_dim * 2, kernel_size=1)
+        self.relu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+        self.fft_norm = fft_norm
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch = x.shape[0]
+        input_dtype = x.dtype
+        input_shape = x.shape[-3:]  # (D, H, W)
+        x = x.float()
+        fft_dim = (-3, -2, -1)
+        ffted = torch.fft.rfftn(x, dim=fft_dim, norm=self.fft_norm)
+        # Stack real/imag: [B, C, 2, D, H, W//2+1]
+        ffted = torch.stack((ffted.real, ffted.imag), dim=2)
+        # Reshape for conv: [B, 2C, D, H, W//2+1]
+        ffted = ffted.view(batch, -1, ffted.size(3), ffted.size(4), ffted.size(5))
+        ffted = self.conv_layer(ffted.float()).float()
+        ffted = self.relu(ffted)
+        ffted = ffted.view(batch, -1, 2, ffted.size(2), ffted.size(3), ffted.size(4))
+        ffted = torch.complex(ffted[:, :, 0], ffted[:, :, 1])
+        output = torch.fft.irfftn(ffted, s=input_shape, dim=fft_dim, norm=self.fft_norm)
+        return output.to(input_dtype)
+
+
+class SpectralTransform3D(nn.Module):
+    """Reduce → FourierUnit3D → restore (mirrors 2D SpectralTransform)."""
+
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        self.conv1 = nn.Sequential(
+            nn.Conv3d(embed_dim, embed_dim // 2, kernel_size=1),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+        )
+        self.fu = FourierUnit3D(embed_dim // 2)
+        self.conv2 = nn.Conv3d(embed_dim // 2, embed_dim, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.conv1(x)
+        out = self.fu(x)
+        out = self.conv2(x + out)  # residual around FFT
+        return out
+
+
+class ResB3D(nn.Module):
+    """Simple 3D residual block (spatial branch of SFB3D)."""
+
+    def __init__(self, embed_dim: int, reduction: int = 1):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv3d(embed_dim, embed_dim // reduction, kernel_size=3, padding=1),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            nn.Conv3d(embed_dim // reduction, embed_dim, kernel_size=3, padding=1),
+        )
+        self.scale = 1.0 / math.sqrt(2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.scale * (x + self.body(x))
+
+
+class SFB3D(nn.Module):
+    """3D Spatial-Frequency Block: local conv branch + global FFT branch fused."""
+
+    def __init__(self, embed_dim: int, reduction: int = 1):
+        super().__init__()
+        self.S = ResB3D(embed_dim, reduction)
+        self.F = SpectralTransform3D(embed_dim)
+        self.norm = LayerNorm3d(embed_dim * 2)
+        self.fusion = nn.Conv3d(embed_dim * 2, embed_dim, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        s = self.S(x)
+        f = self.F(x)
+        out = torch.cat([s, f], dim=1)
+        out = self.norm(out)
+        out = self.fusion(out)
+        return out
+
+
+# =============================================================================
+# FIR Residual Block (3D)
+# =============================================================================
+
+class FIRResBlock3D(nn.Module):
     """
-    3D Residual Block with radius conditioning and optional 3D volumetric attention.
-    
-    For attention: applies 3D Swin attention on entire volume (D, H, W)
-    using 3D window partitioning.
+    3D FIR Residual Block — volumetric counterpart of `FIRResBlock`.
+
+    Flow:
+        x → AdaGN3D + SiLU + Conv3D (radius cond.)
+          → [attention blocks × num_swin_blocks] (Swin3D or Deformable3D)
+          → [SFB3D × num_sfb_blocks]
+          → residual: skip(x) + (1/√2) · h
     """
-    
+
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
         radius_emb_dim: int,
         use_attention: bool = False,
+        use_sfb: bool = True,
         num_heads: int = 8,
-        window_size: int = 8,
         window_size_3d: Tuple[int, int, int] = (2, 8, 8),
         mlp_ratio: float = 4.0,
+        drop_path: float = 0.0,
         dropout: float = 0.0,
+        num_swin_blocks: int = 2,
+        num_sfb_blocks: int = 1,
+        gradient_checkpoint: bool = False,
+        attention_type: str = 'window',
+        deformable_kwargs: Optional[dict] = None,
     ):
         super().__init__()
-        
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.use_attention = use_attention
-        
-        # First conv block
-        self.norm1 = nn.GroupNorm(get_num_groups(in_channels), in_channels)
+        self.use_sfb = use_sfb
+        self.num_swin_blocks = num_swin_blocks
+        self.num_sfb_blocks = num_sfb_blocks
+        self.use_gradient_checkpoint = gradient_checkpoint
+        self.attention_type = attention_type
+
+        # === Stage 1: AdaGN3D + Conv (radius FiLM conditioning) ===
+        self.adagn = AdaGroupNorm3D(in_channels, radius_emb_dim)
         self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1)
-        
-        # Radius embedding projection
-        self.radius_proj = nn.Linear(radius_emb_dim, out_channels)
-        
-        # Optional 3D window-based attention (following paper's simple approach)
-        if use_attention:
-            # Use passed window_size_3d parameter (configurable)
-            # Use TWO Swin blocks: first without shift, second with shift (paper's approach)
-            shift_size_3d = (window_size_3d[0] // 2, window_size_3d[1] // 2, window_size_3d[2] // 2)
-            self.attn_blocks = nn.ModuleList([
-                # Block 1: No shift
-                SwinTransformerBlock3D(
-                    dim=out_channels,
-                    input_resolution=(4, 256, 256),
-                    num_heads=num_heads,
-                    window_size=window_size_3d,
-                    shift_size=(0, 0, 0),
-                    mlp_ratio=mlp_ratio,
-                    drop_path=0.0,
-                ),
-                # Block 2: With shift for cross-window communication
-                SwinTransformerBlock3D(
-                    dim=out_channels,
-                    input_resolution=(4, 256, 256),
-                    num_heads=num_heads,
-                    window_size=window_size_3d,
-                    shift_size=shift_size_3d,
-                    mlp_ratio=mlp_ratio,
-                    drop_path=0.0,
-                ),
-            ])
+
+        # === Stage 2: Attention blocks ===
+        self.attn_blocks: Optional[nn.ModuleList]
+        if use_attention and num_swin_blocks > 0:
+            if attention_type == 'deformable':
+                _dkw = dict(deformable_kwargs or {})
+                self.attn_blocks = nn.ModuleList([
+                    AdaLNZeroDeformableBlock3D(
+                        dim=out_channels,
+                        num_heads=num_heads,
+                        r_emb_dim=radius_emb_dim,
+                        mlp_ratio=mlp_ratio,
+                        drop_path=drop_path,
+                        drop=dropout,
+                        **_dkw,
+                    )
+                    for _ in range(num_swin_blocks)
+                ])
+            else:
+                # Window attention: alternate W-MSA and SW-MSA
+                shift_size_3d = (
+                    window_size_3d[0] // 2,
+                    window_size_3d[1] // 2,
+                    window_size_3d[2] // 2,
+                )
+                self.attn_blocks = nn.ModuleList([
+                    SwinTransformerBlock3D(
+                        dim=out_channels,
+                        input_resolution=(4, 256, 256),  # input_resolution unused at fwd
+                        num_heads=num_heads,
+                        window_size=window_size_3d,
+                        shift_size=(0, 0, 0) if i % 2 == 0 else shift_size_3d,
+                        mlp_ratio=mlp_ratio,
+                        drop_path=drop_path,
+                    )
+                    for i in range(num_swin_blocks)
+                ])
         else:
             self.attn_blocks = None
-        
-        # Second conv block
-        self.norm2 = nn.GroupNorm(get_num_groups(out_channels), out_channels)
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1)
-        
-        # Skip connection
-        if in_channels != out_channels:
-            self.skip_conv = nn.Conv3d(in_channels, out_channels, kernel_size=1)
+
+        # === Stage 3: SFB3D blocks ===
+        if use_sfb and num_sfb_blocks > 0:
+            self.sfb_blocks = nn.ModuleList([
+                SFB3D(out_channels) for _ in range(num_sfb_blocks)
+            ])
         else:
-            self.skip_conv = nn.Identity()
-    
-    def forward(self, x: torch.Tensor, radius_emb: torch.Tensor) -> torch.Tensor:
+            self.sfb_blocks = None
+
+        # === Skip ===
+        if in_channels != out_channels:
+            self.skip = nn.Conv3d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.skip = nn.Identity()
+
+        self.residual_scale = 1.0 / math.sqrt(2)
+
+        # Init
+        nn.init.kaiming_normal_(self.conv1.weight, mode='fan_out', nonlinearity='relu')
+        if self.conv1.bias is not None:
+            nn.init.zeros_(self.conv1.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        r_emb: torch.Tensor,
+        spatial_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
-            x: Input tensor [B, C, D, H, W]
-            radius_emb: Radius embedding [B, radius_emb_dim]
-        
-        Returns:
-            Output tensor [B, out_channels, D, H, W]
+            x: Input [B, C, D, H, W].
+            r_emb: Radius embedding [B, radius_emb_dim].
+            spatial_mask: Optional binary body mask [B, 1, D_orig, H_orig, W_orig]
+                (downsampled internally to current feature resolution and only
+                actually used by deformable attention).
         """
-        h = x
-        
-        # First conv
-        h = self.norm1(h)
+        B, C, D, H, W = x.shape
+
+        identity = self.skip(x)
+
+        h = self.adagn(x, r_emb)
         h = F.silu(h)
         h = self.conv1(h)
-        
-        # Add radius conditioning
-        radius_proj = self.radius_proj(radius_emb)[:, :, None, None, None]
-        h = h + radius_proj
-        
-        # Apply 3D attention on entire volume if enabled
-        if self.attn_blocks is not None:
-            B, C, D, H, W = h.shape
-            # Reshape for 3D attention: [B, C, D, H, W] -> [B, D*H*W, C]
-            h_flat = h.permute(0, 2, 3, 4, 1).reshape(B, D * H * W, C)
-            # Apply 3D attention blocks sequentially
-            for attn_block in self.attn_blocks:
-                h_flat = attn_block(h_flat, (D, H, W))
-            # Reshape back: [B, D*H*W, C] -> [B, C, D, H, W]
-            h = h_flat.reshape(B, D, H, W, C).permute(0, 4, 1, 2, 3)
-        
-        # Second conv
-        h = self.norm2(h)
-        h = F.silu(h)
-        h = self.dropout(h)
-        h = self.conv2(h)
-        
-        # Skip connection
-        return h + self.skip_conv(x)
 
+        # === Attention ===
+        if self.attn_blocks is not None:
+            # [B, C, D, H, W] -> [B, D*H*W, C]
+            h_flat = h.permute(0, 2, 3, 4, 1).reshape(B, D * H * W, h.shape[1])
+
+            # Prepare mask at current feature resolution (only for deformable)
+            mask_at_res = None
+            if spatial_mask is not None and self.attention_type == 'deformable':
+                mask_at_res = F.interpolate(
+                    spatial_mask.float(), size=(D, H, W), mode='nearest'
+                )  # [B, 1, D, H, W]
+
+            for blk in self.attn_blocks:
+                if self.attention_type == 'deformable':
+                    if self.training and self.use_gradient_checkpoint:
+                        if mask_at_res is not None:
+                            h_flat = grad_checkpoint(
+                                blk, h_flat, (D, H, W), r_emb, mask_at_res,
+                                use_reentrant=False,
+                            )
+                        else:
+                            h_flat = grad_checkpoint(
+                                blk, h_flat, (D, H, W), r_emb,
+                                use_reentrant=False,
+                            )
+                    else:
+                        h_flat = blk(
+                            h_flat, (D, H, W), r_emb, spatial_mask=mask_at_res
+                        )
+                else:
+                    # Swin3D path: forward(x, x_size) — no radius/mask
+                    if self.training and self.use_gradient_checkpoint:
+                        h_flat = grad_checkpoint(
+                            blk, h_flat, (D, H, W),
+                            use_reentrant=False,
+                        )
+                    else:
+                        h_flat = blk(h_flat, (D, H, W))
+
+            h = h_flat.reshape(B, D, H, W, -1).permute(0, 4, 1, 2, 3)
+
+        # === SFB3D ===
+        if self.sfb_blocks is not None:
+            for sfb in self.sfb_blocks:
+                if self.training and self.use_gradient_checkpoint:
+                    h = grad_checkpoint(sfb, h, use_reentrant=False)
+                else:
+                    h = sfb(h)
+
+        return identity + self.residual_scale * h
+
+
+# =============================================================================
+# Downsample / Upsample (3D)
+# =============================================================================
 
 class Downsample3D(nn.Module):
-    """3D Downsampling layer - TRUE 3D UNet style: downsamples ALL dimensions."""
-    
+    """3D downsampling via strided conv on all (D, H, W) dims."""
+
     def __init__(self, channels: int):
         super().__init__()
-        # Standard 3D UNet: downsample all dimensions (D, H, W) by 2x
         self.conv = nn.Conv3d(channels, channels, kernel_size=3, stride=2, padding=1)
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
 
 
 class Upsample3D(nn.Module):
-    """3D Upsampling layer - TRUE 3D UNet style: upsamples ALL dimensions."""
-    
+    """3D upsampling via transpose conv on all (D, H, W) dims."""
+
     def __init__(self, channels: int):
         super().__init__()
-        # Use ConvTranspose3d for proper 3D upsampling (standard 3D UNet approach)
         self.conv = nn.ConvTranspose3d(channels, channels, kernel_size=2, stride=2)
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Upsample all dimensions (D, H, W) by 2x
         return self.conv(x)
 
 
+# =============================================================================
+# SwinFIRUNet25D
+# =============================================================================
+
 class SwinFIRUNet25D(nn.Module):
     """
-    2.5D SwinFIR-based UNet for PFGM++ with 3D convolutions.
-    
-    Args:
-        in_channels: Number of input channels (2: noisy_CT + MRI condition).
-        out_channels: Number of output channels (1: predicted vector field).
-        num_slices: Depth dimension (number of consecutive slices).
-        base_channels: Base channel dimension.
-        channel_mults: Channel multipliers for each stage.
-        attention_resolutions: Resolutions where attention is applied.
-        num_res_blocks: Number of residual blocks per stage.
-        radius_emb_dim: Dimension of radius embedding.
-        window_size: Window size for spatial attention (H, W) - used if window_size_3d is single tuple.
-        window_size_3d: Either single tuple (D,H,W) or dict mapping stage_idx -> (D,H,W).
-        dropout: Dropout rate.
+    2.5D SwinFIR UNet with FIR residual blocks, 3D SFB, and optional 3D
+    deformable attention. Volumetric mirror of `SwinFIRUNet`.
     """
-    
+
     def __init__(
         self,
         in_channels: int = 2,
         out_channels: int = 1,
-        num_slices: int = 5,
+        num_slices: int = 8,
         base_channels: int = 64,
         channel_mults: Tuple[int, ...] = (1, 2, 4, 8),
         attention_resolutions: Tuple[int, ...] = (2, 4),
         num_res_blocks: int = 2,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
         radius_emb_dim: int = 256,
-        window_size: int = 8,
-        window_size_3d = (2, 8, 8),
+        window_size: int = 8,  # kept for compatibility (unused at fwd)
+        window_size_3d: Union[Tuple[int, int, int], dict] = (2, 8, 8),
+        num_swin_blocks: int = 2,
+        num_sfb_blocks: int = 1,
+        num_bottleneck_blocks: int = 2,
+        use_sfb: bool = True,
         dropout: float = 0.0,
+        drop_path_rate: float = 0.1,
+        gradient_checkpoint: bool = False,
+        attention_type: str = 'window',
+        deformable_kwargs: Optional[dict] = None,
     ):
         super().__init__()
-        
+
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.num_slices = num_slices
@@ -233,258 +419,244 @@ class SwinFIRUNet25D(nn.Module):
         self.channel_mults = channel_mults
         self.attention_resolutions = attention_resolutions
         self.num_res_blocks = num_res_blocks
+        self.num_bottleneck_blocks = num_bottleneck_blocks
         self.window_size = window_size
-        
-        # Convert window_size_3d to per-stage dict if it's a single tuple
+        self.gradient_checkpoint = gradient_checkpoint
+        self.attention_type = attention_type
+        self.deformable_kwargs = deformable_kwargs or {}
+        # When in_channels==3, body mask is concatenated as 3rd input channel.
+        self.use_mask_channel = (in_channels == 3)
+
+        # Per-stage window sizes
         if isinstance(window_size_3d, (tuple, list)):
-            # Single window size for all stages
             self.window_size_3d = {i: tuple(window_size_3d) for i in range(len(channel_mults))}
         else:
-            # Already a dict mapping stage -> window_size
             self.window_size_3d = window_size_3d
-        
-        # Radius embedding (PFGM++ conditioning)
+
+        # Stochastic depth schedule
+        num_stages = len(channel_mults)
+        total_blocks = num_stages * num_res_blocks * 2
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, max(total_blocks, 1))]
+
+        # Radius embedding
         self.radius_emb = RadiusEmbedding(embed_dim=radius_emb_dim)
-        
-        # Initial 3D convolution
+
+        # Input conv
         self.input_conv = nn.Conv3d(in_channels, base_channels, kernel_size=3, padding=1)
-        
-        # Encoder
+
+        # === Encoder ===
         self.encoder_stages = nn.ModuleList()
         self.downsamples = nn.ModuleList()
-        
         current_channels = base_channels
-        num_stages = len(channel_mults)
-        
+        block_idx = 0
+
         for i, mult in enumerate(channel_mults):
             out_ch = base_channels * mult
             use_attention = (mult in attention_resolutions)
-            
-            # Get stage-specific window size
-            stage_window_size_3d = self.window_size_3d.get(i, (2, 8, 8))
-            
+            stage_ws = self.window_size_3d.get(i, (2, 8, 8))
+
             stage_blocks = nn.ModuleList()
             for j in range(num_res_blocks):
                 stage_blocks.append(
-                    ResBlock3D(
+                    FIRResBlock3D(
                         in_channels=current_channels if j == 0 else out_ch,
                         out_channels=out_ch,
                         radius_emb_dim=radius_emb_dim,
                         use_attention=use_attention,
-                        window_size=window_size,
-                        window_size_3d=stage_window_size_3d,
+                        use_sfb=use_sfb,
+                        num_heads=num_heads,
+                        window_size_3d=stage_ws,
+                        mlp_ratio=mlp_ratio,
+                        drop_path=dpr[block_idx],
                         dropout=dropout,
+                        num_swin_blocks=num_swin_blocks,
+                        num_sfb_blocks=num_sfb_blocks,
+                        gradient_checkpoint=gradient_checkpoint,
+                        attention_type=attention_type,
+                        deformable_kwargs=self.deformable_kwargs,
                     )
                 )
                 current_channels = out_ch
-            
+                block_idx += 1
             self.encoder_stages.append(stage_blocks)
-            
-            # Downsample (except last stage)
+
             if i < num_stages - 1:
                 self.downsamples.append(Downsample3D(current_channels))
-        
-        # Bottleneck (use last stage's window size)
-        bottleneck_window_size_3d = self.window_size_3d.get(len(channel_mults) - 1, (2, 8, 8))
+
+        # === Bottleneck ===
+        bottleneck_ws = self.window_size_3d.get(num_stages - 1, (2, 8, 8))
         self.bottleneck = nn.ModuleList([
-            ResBlock3D(
+            FIRResBlock3D(
                 in_channels=current_channels,
                 out_channels=current_channels,
                 radius_emb_dim=radius_emb_dim,
-                window_size=window_size,
-                window_size_3d=bottleneck_window_size_3d,
+                use_attention=True,
+                use_sfb=use_sfb,
+                num_heads=num_heads,
+                window_size_3d=bottleneck_ws,
+                mlp_ratio=mlp_ratio,
+                drop_path=drop_path_rate,
                 dropout=dropout,
+                num_swin_blocks=num_swin_blocks,
+                num_sfb_blocks=num_sfb_blocks,
+                gradient_checkpoint=gradient_checkpoint,
+                attention_type=attention_type,
+                deformable_kwargs=self.deformable_kwargs,
             )
-            for _ in range(num_res_blocks)
+            for _ in range(num_bottleneck_blocks)
         ])
-        
-        # Decoder
+
+        # === Decoder ===
         self.decoder_stages = nn.ModuleList()
         self.upsamples = nn.ModuleList()
         self.skip_convs = nn.ModuleList()
-        
-        for i in reversed(range(num_stages)):
+
+        for idx, i in enumerate(reversed(range(num_stages))):
             mult = channel_mults[i]
-            prev_mult = channel_mults[i + 1] if i < num_stages - 1 else channel_mults[-1]
             out_ch = base_channels * mult
-            in_ch = base_channels * prev_mult
             use_attention = (mult in attention_resolutions)
-            
-            # Get stage-specific window size
-            stage_window_size_3d = self.window_size_3d.get(i, (2, 8, 8))
-            
-            # Upsample (except first decoder stage)
-            if i < num_stages - 1:
-                self.upsamples.append(Upsample3D(in_ch))
-            
-            # Skip connection conv (to match channels after concatenation)
-            # First decoder stage (i == num_stages-1): just bottleneck channels
-            # Other stages: upsampled channels (in_ch) + skip channels (out_ch)
-            if i == num_stages - 1:
-                skip_in_ch = in_ch  # Just bottleneck output, no concatenation
+            stage_ws = self.window_size_3d.get(i, (2, 8, 8))
+
+            if idx == 0:
+                # First decoder stage: no upsample, no skip concat
+                skip_in_ch = current_channels
             else:
-                skip_in_ch = in_ch + out_ch  # After upsample (in_ch) + skip (out_ch)
+                # Upsample from current_channels to out_ch via ConvTranspose
+                self.upsamples.append(Upsample3D(current_channels))
+                skip_in_ch = current_channels + out_ch  # cat with skip
+
             self.skip_convs.append(nn.Conv3d(skip_in_ch, out_ch, kernel_size=1))
-            
+
             stage_blocks = nn.ModuleList()
             for j in range(num_res_blocks):
                 stage_blocks.append(
-                    ResBlock3D(
+                    FIRResBlock3D(
                         in_channels=out_ch,
                         out_channels=out_ch,
                         radius_emb_dim=radius_emb_dim,
                         use_attention=use_attention,
-                        window_size=window_size,
-                        window_size_3d=stage_window_size_3d,
+                        use_sfb=use_sfb,
+                        num_heads=num_heads,
+                        window_size_3d=stage_ws,
+                        mlp_ratio=mlp_ratio,
+                        drop_path=dpr[block_idx] if block_idx < len(dpr) else drop_path_rate,
                         dropout=dropout,
+                        num_swin_blocks=num_swin_blocks,
+                        num_sfb_blocks=num_sfb_blocks,
+                        gradient_checkpoint=gradient_checkpoint,
+                        attention_type=attention_type,
+                        deformable_kwargs=self.deformable_kwargs,
                     )
                 )
-            
+                block_idx += 1
             self.decoder_stages.append(stage_blocks)
             current_channels = out_ch
-        
-        # Final layers
+
+        # === Output ===
         self.final_norm = nn.GroupNorm(get_num_groups(base_channels), base_channels)
         self.final_conv = nn.Conv3d(base_channels, out_channels, kernel_size=3, padding=1)
-        
-        # Initialize output conv to small values
         nn.init.zeros_(self.final_conv.weight)
         if self.final_conv.bias is not None:
             nn.init.zeros_(self.final_conv.bias)
-        
-        self._initialize_weights()
-    
-    def _initialize_weights(self):
-        """Initialize weights with proper scaling."""
-        for m in self.modules():
-            if isinstance(m, (nn.Conv3d, nn.Linear)):
-                if m is self.final_conv:
-                    continue
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-    
+
     def forward(
         self,
         x: torch.Tensor,
         mri: torch.Tensor,
         r: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Forward pass.
-        
         Args:
-            x: Noisy CT volume [B, 1, D, H, W]
-            mri: MRI condition volume [B, 1, D, H, W]
-            r: PFGM++ radius [B] or [B, 1]
-        
-        Returns:
-            Predicted vector field [B, 1, D, H, W]
+            x: Noisy CT volume [B, 1, D, H, W].
+            mri: MRI condition volume [B, 1, D, H, W].
+            r: PFGM++ radius [B] or [B, 1].
+            mask: Optional binary body mask [B, 1, D, H, W]. Required when
+                  use_mask_channel=True (in_channels=3); also passed through
+                  deformable attention to suppress background K/V.
         """
-        # Ensure all inputs are float32
         x = x.float()
         mri = mri.float()
         r = r.float()
-        
-        # Ensure r is 1D
         if r.dim() > 1:
             r = r.squeeze(-1)
-        
-        # Concatenate noisy CT with MRI condition
-        x = torch.cat([x, mri], dim=1)  # [B, 2, D, H, W]
-        
-        # Radius embedding
-        r_emb = self.radius_emb(r)  # [B, radius_emb_dim]
-        
-        # Initial conv
-        h = self.input_conv(x)  # [B, base_channels, D, H, W]
-        
-        # Encoder with skip connections
+
+        # Concat noisy CT + MRI (+ optional mask channel)
+        if self.use_mask_channel:
+            mask_ch = mask.float() if mask is not None else torch.ones_like(x)
+            x = torch.cat([x, mri, mask_ch], dim=1)  # 3 channels
+        else:
+            x = torch.cat([x, mri], dim=1)  # 2 channels
+
+        # Body mask used for deformable attention masking
+        mask_padded = mask.float().clamp(0, 1) if mask is not None else None
+
+        r_emb = self.radius_emb(r)
+
+        h = self.input_conv(x)
+
+        # Encoder
         skips = []
-        for i, (stage, downsample) in enumerate(zip(
-            self.encoder_stages,
-            self.downsamples + [None]  # No downsample after last stage
-        )):
+        for i, stage in enumerate(self.encoder_stages):
             for block in stage:
-                h = block(h, r_emb)
-            
+                h = block(h, r_emb, spatial_mask=mask_padded)
             skips.append(h)
-            
-            if downsample is not None:
-                h = downsample(h)
-        
+            if i < len(self.downsamples):
+                h = self.downsamples[i](h)
+
         # Bottleneck
         for block in self.bottleneck:
-            h = block(h, r_emb)
-        
-        # Decoder with skip connections
-        for i, (stage, skip_conv) in enumerate(zip(
-            self.decoder_stages,
-            self.skip_convs
-        )):
-            # Upsample (except first decoder stage)
-            if i > 0:
-                h = self.upsamples[i - 1](h)
-                
-                # Concatenate with skip connection
-                skip = skips[-(i + 1)]
-                
-                # Match dimensions if needed (due to downsampling asymmetry)
-                if h.shape != skip.shape:
-                    # Adjust h to match skip dimensions
-                    target_shape = skip.shape[2:]  # (D, H, W)
-                    if h.shape[2:] != target_shape:
-                        h = F.interpolate(h, size=target_shape, mode='trilinear', align_corners=False)
-                
+            h = block(h, r_emb, spatial_mask=mask_padded)
+
+        # Decoder
+        num_stages = len(self.channel_mults)
+        for idx, (stage, skip_conv) in enumerate(zip(self.decoder_stages, self.skip_convs)):
+            if idx > 0:
+                h = self.upsamples[idx - 1](h)
+                skip = skips[-(idx + 1)]
+                # Match dims if shapes differ (asymmetric downsampling)
+                if h.shape[2:] != skip.shape[2:]:
+                    h = F.interpolate(
+                        h, size=skip.shape[2:], mode='trilinear', align_corners=False
+                    )
                 h = torch.cat([h, skip], dim=1)
-            
-            # Process skip concatenation
             h = skip_conv(h)
-            
-            # Apply blocks
             for block in stage:
-                h = block(h, r_emb)
-        
-        # Final output
+                h = block(h, r_emb, spatial_mask=mask_padded)
+
         h = self.final_norm(h)
         h = F.silu(h)
-        output = self.final_conv(h)
-        
-        return output
+        return self.final_conv(h)
 
+
+# =============================================================================
+# Factory
+# =============================================================================
 
 def create_swin_fir_unet_25d(
     in_channels: int = 2,
     out_channels: int = 1,
-    num_slices: int = 5,
+    num_slices: int = 8,
     base_channels: int = 64,
     channel_mults: Tuple[int, ...] = (1, 2, 4, 8),
     attention_resolutions: Tuple[int, ...] = (2, 4),
     num_res_blocks: int = 2,
+    num_heads: int = 8,
+    mlp_ratio: float = 4.0,
     radius_emb_dim: int = 256,
     window_size: int = 8,
-    window_size_3d: Tuple[int, int, int] = (2, 8, 8),
+    window_size_3d: Union[Tuple[int, int, int], dict] = (2, 8, 8),
+    num_swin_blocks: int = 2,
+    num_sfb_blocks: int = 1,
+    num_bottleneck_blocks: int = 2,
+    use_sfb: bool = True,
     dropout: float = 0.0,
+    drop_path_rate: float = 0.1,
+    gradient_checkpoint: bool = False,
+    attention_type: str = 'window',
+    deformable_kwargs: Optional[dict] = None,
 ) -> SwinFIRUNet25D:
-    """
-    Factory function to create a 2.5D SwinFIR UNet.
-    
-    Args:
-        in_channels: Number of input channels (2: CT + MRI).
-        out_channels: Number of output channels (1: predicted field).
-        num_slices: Number of slices in depth dimension.
-        base_channels: Base channel count.
-        channel_mults: Channel multipliers per stage.
-        attention_resolutions: Resolutions where attention is applied.
-        num_res_blocks: Number of residual blocks per stage.
-        radius_emb_dim: Dimension of radius embeddings.
-        window_size: Window size for spatial attention (H, W).
-        window_size_3d: 3D window size (D, H, W) for volumetric attention.
-        dropout: Dropout rate.
-    
-    Returns:
-        Configured 2.5D SwinFIR UNet model.
-    """
+    """Factory for 2.5D SwinFIR UNet — matches `create_swin_fir_unet` 2D API."""
     return SwinFIRUNet25D(
         in_channels=in_channels,
         out_channels=out_channels,
@@ -493,9 +665,18 @@ def create_swin_fir_unet_25d(
         channel_mults=channel_mults,
         attention_resolutions=attention_resolutions,
         num_res_blocks=num_res_blocks,
+        num_heads=num_heads,
+        mlp_ratio=mlp_ratio,
         radius_emb_dim=radius_emb_dim,
         window_size=window_size,
         window_size_3d=window_size_3d,
+        num_swin_blocks=num_swin_blocks,
+        num_sfb_blocks=num_sfb_blocks,
+        num_bottleneck_blocks=num_bottleneck_blocks,
+        use_sfb=use_sfb,
         dropout=dropout,
+        drop_path_rate=drop_path_rate,
+        gradient_checkpoint=gradient_checkpoint,
+        attention_type=attention_type,
+        deformable_kwargs=deformable_kwargs,
     )
-

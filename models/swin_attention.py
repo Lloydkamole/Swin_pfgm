@@ -393,3 +393,192 @@ class SwinTransformerBlock(nn.Module):
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         
         return x
+
+
+class AdaLNZeroSwinTransformerBlock(nn.Module):
+    """
+    Swin Transformer Block with AdaLN-Zero conditioning (DiT-style).
+    
+    Replaces standard LayerNorm with Adaptive Layer Normalization where
+    scale, shift, and gate parameters are predicted from the conditioning
+    embedding (e.g., noise level / radius embedding).
+    
+    The "Zero" refers to zero-initializing the gate projections so that
+    each block starts as an identity function, improving training stability.
+    
+    Forward signature: forward(x, x_size, r_emb)
+        x:     [B, L, C]        feature sequence (L = H*W)
+        x_size: (H, W)          spatial dimensions
+        r_emb: [B, r_emb_dim]   conditioning embedding (radius / noise level)
+    """
+    
+    def __init__(
+        self,
+        dim: int,
+        input_resolution: Tuple[int, int],
+        num_heads: int,
+        r_emb_dim: int,
+        window_size: int = 7,
+        shift_size: int = 0,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+        drop_path: float = 0.0,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.mlp_ratio = mlp_ratio
+        
+        # Adjust window size if input is smaller
+        if min(self.input_resolution) <= self.window_size:
+            self.shift_size = 0
+            self.window_size = min(self.input_resolution)
+        
+        assert 0 <= self.shift_size < self.window_size, "shift_size must be in [0, window_size)"
+        
+        # Layer norms WITHOUT learnable affine (affine comes from conditioning)
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        
+        # AdaLN-Zero modulation: projects r_emb to 6 vectors
+        # (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(r_emb_dim, 6 * dim),
+        )
+        # Zero-init: blocks start as identity
+        nn.init.zeros_(self.adaLN_modulation[1].weight)
+        nn.init.zeros_(self.adaLN_modulation[1].bias)
+        
+        # Window attention
+        self.attn = WindowAttention(
+            dim,
+            window_size=(self.window_size, self.window_size),
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+        )
+        
+        # Stochastic depth
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        
+        # MLP
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(
+            in_features=dim,
+            hidden_features=mlp_hidden_dim,
+            drop=drop,
+        )
+        
+        # Compute attention mask for shifted windows
+        if self.shift_size > 0:
+            attn_mask = self._compute_attn_mask(self.input_resolution)
+        else:
+            attn_mask = None
+        self.register_buffer("attn_mask", attn_mask)
+    
+    def _compute_attn_mask(self, input_resolution: Tuple[int, int]) -> torch.Tensor:
+        """Compute attention mask for SW-MSA (same logic as SwinTransformerBlock)."""
+        H, W = input_resolution
+        img_mask = torch.zeros((1, H, W, 1))
+        
+        h_slices = (
+            slice(0, -self.window_size),
+            slice(-self.window_size, -self.shift_size),
+            slice(-self.shift_size, None),
+        )
+        w_slices = (
+            slice(0, -self.window_size),
+            slice(-self.window_size, -self.shift_size),
+            slice(-self.shift_size, None),
+        )
+        
+        cnt = 0
+        for h in h_slices:
+            for w in w_slices:
+                img_mask[:, h, w, :] = cnt
+                cnt += 1
+        
+        mask_windows = window_partition(img_mask, self.window_size)
+        mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-1e5))
+        
+        return attn_mask
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_size: Optional[Tuple[int, int]],
+        r_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Forward pass with AdaLN-Zero conditioning.
+        
+        Args:
+            x: Input tensor [B, L, C] where L = H*W
+            x_size: (H, W) spatial dimensions
+            r_emb: Conditioning embedding [B, r_emb_dim]
+        
+        Returns:
+            Output tensor [B, L, C]
+        """
+        H, W = x_size if x_size is not None else self.input_resolution
+        B, L, C = x.shape
+        assert L == H * W, f"Input size mismatch: {L} != {H}*{W}"
+        
+        # Compute all 6 modulation parameters at once
+        # Each is [B, dim], unsqueeze to [B, 1, dim] for broadcasting with [B, L, C]
+        modulation = self.adaLN_modulation(r_emb)  # [B, 6*dim]
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation.chunk(6, dim=-1)
+        
+        # === Attention branch with AdaLN-Zero ===
+        shortcut = x
+        x = self.norm1(x) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        x = x.view(B, H, W, C)
+        
+        # Cyclic shift for SW-MSA
+        if self.shift_size > 0:
+            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        else:
+            shifted_x = x
+        
+        # Partition into windows
+        x_windows = window_partition(shifted_x, self.window_size)
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
+        
+        # Window attention
+        if self.input_resolution == (H, W):
+            attn_mask = self.attn_mask
+        else:
+            attn_mask = self._compute_attn_mask((H, W)).to(x.device) if self.shift_size > 0 else None
+        
+        attn_windows = self.attn(x_windows, mask=attn_mask)
+        
+        # Merge windows
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        shifted_x = window_reverse(attn_windows, self.window_size, H, W)
+        
+        # Reverse cyclic shift
+        if self.shift_size > 0:
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            x = shifted_x
+        
+        x = x.view(B, H * W, C)
+        
+        # Gated residual (gate_msa starts at 0 → identity at init)
+        x = shortcut + gate_msa.unsqueeze(1) * self.drop_path(x)
+        
+        # === MLP branch with AdaLN-Zero ===
+        x = x + gate_mlp.unsqueeze(1) * self.drop_path(
+            self.mlp(self.norm2(x) * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1))
+        )
+        
+        return x

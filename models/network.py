@@ -40,6 +40,15 @@ import torch.nn.functional as F
 from .embeddings import RadiusEmbedding
 from .fir_blocks import FIRResBlock, Downsample, Upsample, SFB, LayerNorm2d
 
+# Cross-attention is only constructed when use_foundation_cond=True; the import
+# is lazy-friendly (only top-level imported, no functional change otherwise).
+from .cross_attention import CrossAttention
+
+# Foundation-encoder token dim (MedSAM ViT-B image encoder neck output).
+# Kept here as a default so existing call sites and tests don't need to know
+# anything about MedSAM unless they opt-in via use_foundation_cond=True.
+_DEFAULT_FOUNDATION_DIM = 256
+
 
 class SwinFIRUNet(nn.Module):
     """
@@ -91,6 +100,14 @@ class SwinFIRUNet(nn.Module):
         dropout: float = 0.0,
         drop_path_rate: float = 0.1,
         gradient_checkpoint: bool = False,
+        attention_type: str = 'window',
+        deformable_kwargs: dict = None,
+        # ---- Foundation-model conditioning (MedSAM) ----
+        # Defaults to OFF so existing checkpoints / call sites are unaffected.
+        use_foundation_cond: bool = False,
+        foundation_token_dim: int = _DEFAULT_FOUNDATION_DIM,
+        foundation_xattn_heads: int = 8,
+        foundation_xattn_dim_head: int = 64,
     ):
         super().__init__()
         
@@ -103,6 +120,10 @@ class SwinFIRUNet(nn.Module):
         self.num_sfb_blocks = num_sfb_blocks
         self.num_bottleneck_blocks = num_bottleneck_blocks
         self.gradient_checkpoint = gradient_checkpoint
+        self.attention_type = attention_type
+        self.deformable_kwargs = deformable_kwargs or {}
+        # When in_channels == 3 the third channel is the body mask (input conditioning).
+        self.use_mask_channel = (in_channels == 3)
         
         # Calculate stochastic depth rates
         num_stages = len(channel_mults)
@@ -147,6 +168,8 @@ class SwinFIRUNet(nn.Module):
                         drop_path=dpr[block_idx],
                         dropout=dropout,
                         gradient_checkpoint=gradient_checkpoint,
+                        attention_type=attention_type,
+                        deformable_kwargs=self.deformable_kwargs,
                     )
                 )
                 current_channels = out_ch
@@ -174,6 +197,8 @@ class SwinFIRUNet(nn.Module):
                 drop_path=drop_path_rate,
                 dropout=dropout,
                 gradient_checkpoint=gradient_checkpoint,
+                attention_type=attention_type,
+                deformable_kwargs=self.deformable_kwargs,
             )
             for _ in range(num_bottleneck_blocks)
         ])
@@ -216,6 +241,8 @@ class SwinFIRUNet(nn.Module):
                         drop_path=dpr[block_idx % len(dpr)],
                         dropout=dropout,
                         gradient_checkpoint=gradient_checkpoint,
+                        attention_type=attention_type,
+                        deformable_kwargs=self.deformable_kwargs,
                     )
                 )
                 block_idx += 1
@@ -232,6 +259,46 @@ class SwinFIRUNet(nn.Module):
             nn.init.zeros_(self.final_conv.bias)
         
         self._initialize_weights()
+
+        # ----------------------------------------------------------------
+        # Foundation-model conditioning hooks (built AFTER _initialize_weights
+        # so the kaiming init can't touch our zero-init projections).
+        # ----------------------------------------------------------------
+        self.use_foundation_cond = bool(use_foundation_cond)
+        self.foundation_token_dim = int(foundation_token_dim)
+        if self.use_foundation_cond:
+            # Bottleneck channel dim = base_channels * channel_mults[-1].
+            bottleneck_ch = base_channels * channel_mults[-1]
+            # Global path: pooled foundation vec -> radius_emb_dim, added to r_emb.
+            # Final Linear is zero-init so contribution starts at exactly 0.
+            cond_global_linear = nn.Linear(self.foundation_token_dim, radius_emb_dim)
+            nn.init.zeros_(cond_global_linear.weight)
+            nn.init.zeros_(cond_global_linear.bias)
+            self.cond_global_proj = nn.Sequential(nn.SiLU(), cond_global_linear)
+            # Spatial path: cross-attention from bottleneck features to the
+            # foundation token grid. CrossAttention's `to_out` is already
+            # zero-initialized; we additionally gate the residual with a
+            # learnable scalar that starts at 0.
+            self.bottleneck_xattn = CrossAttention(
+                query_dim=bottleneck_ch,
+                context_dim=self.foundation_token_dim,
+                heads=foundation_xattn_heads,
+                dim_head=foundation_xattn_dim_head,
+            )
+            self.bottleneck_xattn_gate = nn.Parameter(torch.zeros(1))
+            # Identity-init context projection: lets the cross-attention adapt
+            # MedSAM's frozen feature distribution without touching MedSAM.
+            self.context_proj = nn.Linear(
+                self.foundation_token_dim, self.foundation_token_dim
+            )
+            with torch.no_grad():
+                self.context_proj.weight.copy_(torch.eye(self.foundation_token_dim))
+                self.context_proj.bias.zero_()
+        else:
+            self.cond_global_proj = None
+            self.bottleneck_xattn = None
+            self.bottleneck_xattn_gate = None
+            self.context_proj = None
     
     def _initialize_weights(self):
         """Initialize weights with proper scaling."""
@@ -266,6 +333,9 @@ class SwinFIRUNet(nn.Module):
         x: torch.Tensor,
         mri: torch.Tensor,
         r: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        cond_tokens: Optional[torch.Tensor] = None,
+        cond_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass.
@@ -274,7 +344,21 @@ class SwinFIRUNet(nn.Module):
             x: Noisy CT image of shape [B, 1, H, W]
             mri: MRI condition image of shape [B, 1, H, W]
             r: PFGM++ radius of shape [B] or [B, 1]
-        
+            mask: Optional binary body mask [B, 1, H, W].
+                When use_mask_channel=True (i.e. in_channels=3), the mask is
+                concatenated as a 3rd input channel AND threaded through
+                deformable attention blocks to suppress background K/V features.
+                When mask=None with use_mask_channel=True, the mask channel is
+                filled with ones (assume all-body) so the architecture still works.
+            cond_tokens: Optional foundation-encoder dense tokens, shape
+                [B, 64, 64, foundation_token_dim] (NHWC) or
+                [B, N, foundation_token_dim]. Used for the bottleneck cross-
+                attention path. Ignored unless use_foundation_cond=True.
+            cond_global: Optional foundation-encoder pooled vector,
+                shape [B, foundation_token_dim]. Added (after MLP) to r_emb so
+                every AdaLN block sees the slice-level prior. Ignored unless
+                use_foundation_cond=True.
+
         Returns:
             Predicted vector field of shape [B, 1, H, W]
         """
@@ -287,17 +371,56 @@ class SwinFIRUNet(nn.Module):
         if r.dim() > 1:
             r = r.squeeze(-1)
         
-        # Concatenate noisy CT with MRI condition
-        # Input: [noisy_CT, MRI] -> 2 channels
-        x = torch.cat([x, mri], dim=1)
+        # Concatenate noisy CT with MRI condition (+ optional body mask channel)
+        if self.use_mask_channel:
+            mask_ch = mask.float() if mask is not None else torch.ones_like(x)
+            x = torch.cat([x, mri, mask_ch], dim=1)  # 3 channels
+        else:
+            x = torch.cat([x, mri], dim=1)  # 2 channels
         
         # Pad to window size
         x, orig_size = self._pad_to_window_size(x)
         B, _, H, W = x.shape
+        orig_h, orig_w = orig_size
+
+        # Prepare padded body mask for attention masking (separate from input channel)
+        if mask is not None:
+            pad_h = H - mask.shape[2]
+            pad_w = W - mask.shape[3]
+            mask_float = mask.float()
+            if pad_h > 0 or pad_w > 0:
+                mask_float = F.pad(
+                    mask_float, (0, pad_w, 0, pad_h), mode='constant', value=0
+                )
+            mask_padded = mask_float.clamp(0, 1)  # [B, 1, H, W]
+        else:
+            mask_padded = None
         
         # Radius embedding
         r_emb = self.radius_emb(r)  # [B, radius_emb_dim]
-        
+
+        # ---- Global foundation conditioning (zero-init at start) ----
+        # Adds a slice-level prior to r_emb, broadcasting through every
+        # downstream AdaLN-Zero block automatically. No-op if use_foundation_cond
+        # is False or cond_global is None.
+        if self.use_foundation_cond and cond_global is not None:
+            r_emb = r_emb + self.cond_global_proj(cond_global.to(r_emb.dtype))
+
+        # ---- Spatial foundation context (precomputed once per cross-attn) ----
+        # We project once here, not inside the bottleneck loop, so the projection
+        # cost is paid one time even if the bottleneck has multiple blocks.
+        ctx_tokens = None
+        if (
+            self.use_foundation_cond
+            and cond_tokens is not None
+            and self.bottleneck_xattn is not None
+        ):
+            # Accept either [B, 64, 64, C] (NHWC) or [B, N, C] (already flat).
+            t = cond_tokens.to(dtype=torch.float32)
+            if t.dim() == 4:
+                t = t.flatten(1, 2)  # [B, H*W, C]
+            ctx_tokens = self.context_proj(t)
+
         # Initial conv
         h = self.input_conv(x)  # [B, base_channels, H, W]
         
@@ -310,7 +433,7 @@ class SwinFIRUNet(nn.Module):
             self.downsamples + [None]  # No downsample after last stage
         )):
             for block in stage:
-                h = block(h, r_emb, x_size=current_size)
+                h = block(h, r_emb, x_size=current_size, spatial_mask=mask_padded)
             
             skips.append(h)
             
@@ -318,9 +441,19 @@ class SwinFIRUNet(nn.Module):
                 h = downsample(h)
                 current_size = (current_size[0] // 2, current_size[1] // 2)
         
-        # Bottleneck
-        for block in self.bottleneck:
-            h = block(h, r_emb, x_size=current_size)
+        # Bottleneck. When foundation conditioning is active and tokens are
+        # supplied, insert a single cross-attention residual between the first
+        # and remaining bottleneck blocks (zero-gated at init -> identity).
+        for bi, block in enumerate(self.bottleneck):
+            h = block(h, r_emb, x_size=current_size, spatial_mask=mask_padded)
+            if (
+                bi == 0
+                and ctx_tokens is not None
+                and self.bottleneck_xattn is not None
+            ):
+                h = h + self.bottleneck_xattn_gate * self.bottleneck_xattn(
+                    h, ctx_tokens.to(h.dtype)
+                )
         
         # Decoder with skip connections
         for i, (stage, skip_conv) in enumerate(zip(
@@ -341,7 +474,7 @@ class SwinFIRUNet(nn.Module):
             
             # Apply blocks
             for block in stage:
-                h = block(h, r_emb, x_size=current_size)
+                h = block(h, r_emb, x_size=current_size, spatial_mask=mask_padded)
         
         # Final output
         h = self.final_norm(h)
@@ -349,7 +482,6 @@ class SwinFIRUNet(nn.Module):
         h = self.final_conv(h)
         
         # Remove padding
-        orig_h, orig_w = orig_size
         h = h[:, :, :orig_h, :orig_w]
         
         return h

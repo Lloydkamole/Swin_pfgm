@@ -19,26 +19,60 @@ from monai.transforms import (
     EnsureChannelFirstd,
     Orientationd,
     ScaleIntensityRanged,
+    RandFlipd,
+    RandAffined,
+    RandGaussianNoised,
+    RandAdjustContrastd,
 )
 from torch.utils.data import Dataset
 import nibabel as nib
 
 
-def get_monai_nifti_transforms_25d(mode="train"):
+def get_monai_nifti_transforms_25d(mode="train", use_body_mask=False):
     """
     Define MONAI transforms for loading 3D NIfTI data.
-    No augmentation for now - can be added later with 3D augmentations.
+    Includes data augmentation for training mode (matching loader.py).
+    
+    Augmentations (train only):
+    - Random flips along spatial axes (H, W only — no depth flips to preserve slice ordering)
+    - Random affine (small rotation + scale in H,W plane)
+    - Random Gaussian noise on MRI only
+    - Random contrast adjustment on MRI only
+
+    Mask key uses allow_missing_keys=True so samples without a mask
+    file simply skip mask-related transforms instead of erroring.
     """
     keys = ["mr", "ct"]
+    keys_with_mask = ["mr", "ct", "mask"] if use_body_mask else keys
+    resize_modes = ["bilinear", "bilinear"] + (["nearest"] if use_body_mask else [])
     
-    transforms = [
-        LoadImaged(keys=keys, image_only=True),
-        EnsureChannelFirstd(keys=keys),
-        Orientationd(keys=keys, axcodes="RAS"),
+    base_transforms = [
+        LoadImaged(keys=keys_with_mask, image_only=True, allow_missing_keys=True),
+        EnsureChannelFirstd(keys=keys_with_mask, allow_missing_keys=True),
+        Orientationd(keys=keys_with_mask, axcodes="RAS", allow_missing_keys=True),
     ]
     
-    # Note: We'll do intensity normalization per-slice in the dataset
-    # to maintain compatibility with 2D preprocessing
+    if mode == "train":
+        transforms = base_transforms + [
+            # Spatial flips: axis 0 = H (LR), axis 1 = W (AP) — skip axis 2 (depth/SI)
+            RandFlipd(keys=keys_with_mask, prob=0.5, spatial_axis=0, allow_missing_keys=True),
+            RandFlipd(keys=keys_with_mask, prob=0.5, spatial_axis=1, allow_missing_keys=True),
+            # Small in-plane rotation + scale (no depth rotation)
+            # RandAffined(
+            #     keys=keys_with_mask,
+            #     prob=0.2,
+            #     rotate_range=(0.0, 0.0, np.deg2rad(5.0)),
+            #     scale_range=(0.05, 0.05, 0.0),
+            #     mode=resize_modes,
+            #     padding_mode="border",
+            #     allow_missing_keys=True,
+            # ),
+            # # Intensity augmentation on MRI only
+            # RandGaussianNoised(keys=["mr"], prob=0.15, mean=0.0, std=0.02),
+            # RandAdjustContrastd(keys=["mr"], prob=0.15, gamma=(0.9, 1.1)),
+        ]
+    else:
+        transforms = base_transforms
     
     return Compose(transforms)
 
@@ -58,12 +92,13 @@ class MonaiNifti25DDataset(Dataset):
         stride (int): Stride between volume centers. If None, defaults to num_slices (non-overlapping).
     """
     
-    def __init__(self, data, transform, target_size=256, num_slices=5, stride=None):
+    def __init__(self, data, transform, target_size=256, num_slices=5, stride=None, use_body_mask=False):
         self.file_list = data
         self.transform = transform
         self.target_size = target_size
         self.num_slices = num_slices
         self.stride = stride if stride is not None else num_slices
+        self.use_body_mask = use_body_mask
         self.volume_map = []
         
         print(f"Pre-scanning NIfTI files for 2.5D volumes (num_slices={num_slices}, stride={self.stride})...")
@@ -106,8 +141,12 @@ class MonaiNifti25DDataset(Dataset):
         file_paths = self.file_list[file_idx]
         
         try:
-            # Load 3D volumes
-            volumes = self.transform(file_paths)
+            # Load 3D volumes - conditionally include mask path
+            transform_input = {"mr": file_paths["mr"], "ct": file_paths["ct"]}
+            if self.use_body_mask and file_paths.get("mask") is not None:
+                transform_input["mask"] = file_paths["mask"]
+            
+            volumes = self.transform(transform_input)
             mr_vol = volumes["mr"]  # [C, H, W, D]
             ct_vol = volumes["ct"]  # [C, H, W, D]
             
@@ -119,6 +158,13 @@ class MonaiNifti25DDataset(Dataset):
             # Extract volume slices [C, H, W, num_slices]
             mr_volume = mr_vol[:, :, :, start_idx:end_idx]
             ct_volume = ct_vol[:, :, :, start_idx:end_idx]
+            
+            # Extract mask volume if available
+            mask_volume = None
+            if self.use_body_mask and "mask" in volumes:
+                mask_vol = volumes["mask"]  # [C, H, W, D]
+                mask_volume = mask_vol[:, :, :, start_idx:end_idx]
+                mask_volume = (mask_volume > 0).float()  # Binary conversion
             
             # Resize spatial dimensions if needed
             if mr_volume.shape[1] != self.target_size or mr_volume.shape[2] != self.target_size:
@@ -144,20 +190,43 @@ class MonaiNifti25DDataset(Dataset):
                 # Reshape back to [C, H, W, D]
                 mr_volume = mr_volume.reshape(C, D, self.target_size, self.target_size).permute(0, 2, 3, 1)
                 ct_volume = ct_volume.reshape(C, D, self.target_size, self.target_size).permute(0, 2, 3, 1)
+                
+                # Resize mask with nearest interpolation to preserve binary values
+                if mask_volume is not None:
+                    Cm, Hm, Wm, Dm = mask_volume.shape
+                    mask_volume = mask_volume.permute(0, 3, 1, 2).reshape(Cm*Dm, Hm, Wm)
+                    mask_volume = torch.nn.functional.interpolate(
+                        mask_volume.unsqueeze(0),
+                        size=(self.target_size, self.target_size),
+                        mode='nearest',
+                    ).squeeze(0)
+                    mask_volume = mask_volume.reshape(Cm, Dm, self.target_size, self.target_size).permute(0, 2, 3, 1)
             
             # Rearrange to [C, D, H, W] for 3D convolutions
             mr_volume = mr_volume.permute(0, 3, 1, 2)  # [C, D, H, W]
             ct_volume = ct_volume.permute(0, 3, 1, 2)  # [C, D, H, W]
             
-            return {
+            output = {
                 "mr": mr_volume.float(),
                 "ct": ct_volume.float()
             }
             
+            if self.use_body_mask:
+                if mask_volume is not None:
+                    mask_volume = mask_volume.permute(0, 3, 1, 2)  # [C, D, H, W]
+                    output["mask"] = mask_volume.float()
+                else:
+                    output["mask"] = torch.ones(1, self.num_slices, self.target_size, self.target_size, dtype=torch.float32)
+            
+            return output
+            
         except Exception as e:
             print(f"Error loading 2.5D volume {idx} (file {file_paths.get('id', 'unknown')}, center {center_idx}): {e}")
             # Return zero tensors
-            return {
+            output = {
                 "mr": torch.zeros(1, self.num_slices, self.target_size, self.target_size, dtype=torch.float32),
                 "ct": torch.zeros(1, self.num_slices, self.target_size, self.target_size, dtype=torch.float32)
             }
+            if self.use_body_mask:
+                output["mask"] = torch.ones(1, self.num_slices, self.target_size, self.target_size, dtype=torch.float32)
+            return output

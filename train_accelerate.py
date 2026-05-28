@@ -159,7 +159,7 @@ class EMA:
 
 config = {
     # Data Settings
-    "data_dir": "/mnt/nvme/lloyd/DL project CT-MRI/pfgm_train_brain_new",
+    "data_dir": "/mnt/nvme/lloyd/DL project CT-MRI/pfgm_brain_train_n",
     "mr_pattern": "mr.nii", # Suffix pattern to match MRI files
     "ct_pattern": "ct.nii", # Suffix pattern to match CT files
     "train_split": 0.9,
@@ -170,34 +170,43 @@ config = {
     "base_channels": 64,   # Reduced from 128 for memory
     "channel_mults": [1, 2, 4, 8],  # 4 stages: optimal for 256x256 (64→128→256→512 ch)
     "num_res_blocks": 2,  # Number of times the Swin+SFB block repeats per encoder/decoder stage
-    "attention_resolutions": [2, 4, 8],  # Enable attention at 256ch and 512ch stages (critical!)
+    "attention_resolutions": [4, 8],  # Enable attention at 256ch and 512ch stages (critical!)
     "num_heads": 8,
     "mlp_ratio": 4.0, # MLP expansion ratio in transformer blocks
     "radius_emb_dim": 256,
     "window_size": 8, # Swin Transformer window size
-    "num_swin_blocks": 6,  # Number of Swin attention blocks per FIRResBlock (W-MSA + SW-MSA pattern)
+    "num_swin_blocks": 4,  # Number of Swin attention blocks per FIRResBlock (W-MSA + SW-MSA pattern)
     "num_sfb_blocks": 1,   # Number of SFB blocks per FIRResBlock (sequential after Swin)
     "num_bottleneck_blocks": 2,  # Number of residual blocks in the bottleneck
     "use_sfb": True,  # Use Spatial-Frequency Blocks
-    "dropout": 0.05,
-    "drop_path": 0.0,
+    "dropout": 0.00,
+    "drop_path": 0.1,
     "gradient_checkpoint": True,  # Trade ~30% speed for ~60% activation memory savings
     
     # EDM Parameters
     "sigma_min": 0.01,
     "sigma_max": 80.0,
     "sigma_data": 0.45, # 0.5 for [-1,1] normalized data, 1.0 for z-normalized
-    "P_mean": -0.8, #changed for pfgm++
-    "P_std": 1,   # changed for pfgm++
+    "P_mean": -1.2, #changed for pfgm++
+    "P_std": 1.2,   # changed for pfgm++
     "rho": 7.0,
     "loss_type": "l2",
     
     # PFGM++ Parameters
     "pfgmpp": True,                      # Enable PFGM++ mode (vs pure EDM)
     "D": 128,                            # Augmented dimension for PFGM++ (D→∞ recovers EDM)
-      
+
+    # EDM Stochastic Sampling (Algorithm 2 in EDM paper)
+    # 0.0 = deterministic Heun. Small positive values (S_churn ~5-40) inject
+    # extra noise during sampling and often improve perceptual quality on PFGM++.
+    "S_churn": 20.0,                      # Total stochasticity budget across all steps
+    "S_min": 0.05,                        # Apply churn only when sigma >= S_min
+    "S_max": 50.0,               # Apply churn only when sigma <= S_max
+    "S_noise": 1.0,                      # Noise scale (paper uses 1.003 for ImageNet)
+
     # Classifier-Free Guidance (CFG)
-    "cond_drop_prob": 0.1,               # Probability of dropping MRI conditioning (0.0 = no CFG)
+    "cond_drop_prob": 0.1,               # Initial probability of dropping MRI conditioning (0.0 = no CFG)
+    "cond_drop_prob_end_epoch": 0,      # Epoch at which cond_drop_prob reaches 0.0 (linear decay)
     "cfg_scale": 2.0,                    # Guidance scale at inference (1.0 = no guidance)
     
     # CFG++ and Dynamic Scaling (for sampling/generation)
@@ -205,7 +214,7 @@ config = {
     "cfg_rescale_factor": 0.7,           # Rescale factor for CFG++ (0.0 = no rescale, 1.0 = full rescale)
     "use_dynamic_cfg": True,             # Use dynamic CFG scaling
     "cfg_scale_min": 1.0,                # Minimum CFG scale (at end of sampling)
-    "cfg_scale_max": 3.0,                # Maximum CFG scale (at start of sampling)
+    "cfg_scale_max": 2.0,                # Maximum CFG scale (at start of sampling)
     
     # Masked Loss (Anatomical Focusing)
     "use_masked_loss": False,             # Enable masked loss (body-only)
@@ -219,15 +228,15 @@ config = {
     
     # Training Parameters
     "num_epochs": 150,
-    "batch_size": 15,  # Per GPU batch size (reduced for memory)
-    "lr": 1e-3,
+    "batch_size": 20,  # Per GPU batch size (reduced for memory)
+    "lr": 4e-4,
     "weight_decay": 0.01,
-    "grad_clip": None,  # Enable gradient clipping
-    "warmup_steps": 200,
+    "grad_clip": 1.0,  # Enable gradient clipping
+    "warmup_steps": 500,
     
     # Sampling / Generation
-    "num_sample_steps": 25,
-    "num_val_samples": 3,
+    "num_sample_steps": 50,
+    "num_val_samples": 5,
     
     # Logging & Checkpointing
     "output_dir": "./outputs_accelerate",
@@ -244,7 +253,7 @@ config = {
     
     # System
     "seed": 42,
-    "num_workers": 12,
+    "num_workers": 4,
     "mixed_precision": "bf16",  # "no", "fp16", or "bf16"
     
     # EMA (Exponential Moving Average)
@@ -255,6 +264,10 @@ config = {
     # Test-Time Augmentation (TTA) for validation generation
     "use_tta": False,                    # Enable Flip TTA during val generation (4x slower)
     "tta_flips": ["lr", "ud", "lr_ud"], # Which flips: "lr", "ud", "lr_ud"
+    
+    # Attention type: 'window' (original Swin) or 'deformable' (DAT++ with QK-Norm)
+    "attention_type": "deformable",
+    "deformable_kwargs": {"n_groups": 8, "kv_stride": 2, "offset_range_factor": 4.0},           # e.g. {"n_groups": 4, "kv_stride": 1}
 }
 
 
@@ -328,6 +341,7 @@ def edm_precond(
     mri: torch.Tensor,
     sigma: torch.Tensor,
     sigma_data: float = 0.5,
+    mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Apply EDM preconditioning to model output."""
     x = x.float()
@@ -341,7 +355,7 @@ def edm_precond(
     c_noise = sigma.log() / 4
     
     x_scaled = c_in * x
-    F_x = model(x_scaled, mri, c_noise)
+    F_x = model(x_scaled, mri, c_noise, mask=mask)
     D_x = c_skip * x + c_out * F_x
     
     return D_x
@@ -395,10 +409,13 @@ def pfgmpp_perturbation(
     # r = sigma * sqrt(D) - the PFGM++ transfer formula
     r = sigma.double() * np.sqrt(D)
     
-    # Sample from inverse-beta (beta-prime) distribution
-    # Beta(N/2, D/2) then inverse_beta = beta / (1 - beta)
-    samples_norm = np.random.beta(a=N / 2., b=D / 2., size=B).astype(np.float64)
-    samples_norm = torch.from_numpy(samples_norm).to(device)
+    # Sample from inverse-beta (beta-prime) distribution directly on GPU
+    # Beta(N/2, D/2) → use torch.distributions to avoid CPU↔GPU transfer
+    beta_dist = torch.distributions.Beta(
+        torch.tensor(N / 2., device=device, dtype=torch.float64),
+        torch.tensor(D / 2., device=device, dtype=torch.float64),
+    )
+    samples_norm = beta_dist.sample((B,))
     inverse_beta = samples_norm / (1 - samples_norm + 1e-8)
     
     # Radius = r * sqrt(inverse_beta)
@@ -501,9 +518,12 @@ def pfgmpp_sample_prior(
     # r_max = sigma_max * sqrt(D)
     r_max = sigma_max * np.sqrt(D)
     
-    # Sample from inverse-beta distribution
-    samples_norm = np.random.beta(a=N / 2., b=D / 2., size=batch_size).astype(np.float64)
-    samples_norm = torch.from_numpy(samples_norm).to(device)
+    # Sample from inverse-beta distribution (directly on GPU)
+    beta_dist = torch.distributions.Beta(
+        torch.tensor(N / 2., device=device, dtype=torch.float64),
+        torch.tensor(D / 2., device=device, dtype=torch.float64),
+    )
+    samples_norm = beta_dist.sample((batch_size,))
     inverse_beta = samples_norm / (1 - samples_norm + 1e-8)
     
     # Radius = r_max * sqrt(inverse_beta)
@@ -573,7 +593,7 @@ def edm_loss(
         mri = mri.clone()
         mri[drop_mask] = 0.0
     
-    D_x = edm_precond(model, x_noisy, mri, sigma, sigma_data)
+    D_x = edm_precond(model, x_noisy, mri, sigma, sigma_data, mask=body_mask)
     
     sigma_v = sigma.view(-1, 1, 1, 1)
     weight = (sigma_v ** 2 + sigma_data ** 2) / ((sigma_v * sigma_data) ** 2)
@@ -611,7 +631,7 @@ def edm_loss(
             # Masked MSE (nnsyn-style)
             masked_pred = D_x * mask_used
             masked_target = x_clean * mask_used
-            num_masked_pixels = mask_used.sum()
+            num_masked_pixels = mask_used.sum().item()
             if num_masked_pixels > 0:
                 mse = ((masked_pred - masked_target) ** 2).sum() / num_masked_pixels
                 mse = mse.item()
@@ -668,7 +688,18 @@ def compute_masked_metrics(
         Dictionary with psnr, ssim, mae values
     """
     metrics = {}
-    
+
+    # Reset stateful torchmetrics objects so each call returns the per-batch
+    # value rather than the cumulative running mean accumulated since the
+    # metric was created (otherwise epoch-N values are dragged down by all
+    # earlier noisy batches, which especially hurts SSIM).
+    if psnr_metric is not None:
+        psnr_metric.reset()
+    if ssim_metric is not None:
+        ssim_metric.reset()
+    if mae_metric is not None:
+        mae_metric.reset()
+
     if mask is not None:
         # Apply mask - set outside region to 0 for fair comparison
         # This follows nnsyn approach where outside is set to constant value
@@ -696,7 +727,7 @@ def compute_masked_metrics(
     if mae_metric is not None:
         if mask is not None:
             # Compute MAE only on masked region
-            num_masked = mask.sum()
+            num_masked = mask.sum().item()
             if num_masked > 0:
                 mae_val = (pred_masked - target_masked).abs().sum() / num_masked
                 metrics['mae'] = mae_val.item()
@@ -775,23 +806,30 @@ def edm_sample_tta(
         mri: Conditioning MRI images [B, 1, H, W]
         tta_flips: List of flip types: "lr", "ud", "lr_ud"
         **sample_kwargs: All other arguments forwarded to edm_sample()
+                         (including optional 'mask' for body-mask models)
     
     Returns:
         Averaged CT prediction [B, 1, H, W]
     """
+    # Extract mask (must be flipped alongside MRI for spatial consistency)
+    mask = sample_kwargs.pop('mask', None)
+
     # Remove return_trajectory_stats for TTA (only use stats from original)
     sample_kwargs_no_stats = {k: v for k, v in sample_kwargs.items()
                               if k != 'return_trajectory_stats'}
     sample_kwargs_no_stats['return_trajectory_stats'] = False
     
     # 1) Original (unflipped) prediction
-    pred_original = edm_sample(model, mri, **sample_kwargs_no_stats)
+    pred_original = edm_sample(model, mri, mask=mask, **sample_kwargs_no_stats)
     preds = [pred_original]
     
     # 2) Flipped predictions
     for flip_type in tta_flips:
         mri_flipped = _flip_tensor(mri, flip_type)
-        pred_flipped = edm_sample(model, mri_flipped, **sample_kwargs_no_stats)
+        mask_flipped = _flip_tensor(mask, flip_type) if mask is not None else None
+        pred_flipped = edm_sample(
+            model, mri_flipped, mask=mask_flipped, **sample_kwargs_no_stats
+        )
         # Flip prediction back to original orientation
         pred_unflipped = _flip_tensor(pred_flipped, flip_type)
         preds.append(pred_unflipped)
@@ -824,6 +862,7 @@ def edm_sample(
     use_dynamic_cfg: bool = False,
     cfg_scale_min: float = 1.0,
     cfg_scale_max: float = 3.0,
+    mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Generate CT images from MRI using EDM/PFGM++ sampling.
@@ -846,6 +885,9 @@ def edm_sample(
         use_dynamic_cfg: Enable dynamic CFG scaling.
         cfg_scale_min: Minimum CFG scale (at end of sampling).
         cfg_scale_max: Maximum CFG scale (at start of sampling).
+        mask: Optional binary body mask [B, 1, H, W]. Required when model was
+              trained with use_body_mask=True (in_channels=3). Pass None to
+              let the model fall back to an all-ones mask (assume all-body).
     """
     B, C, H, W = mri.shape
     device = mri.device
@@ -894,11 +936,11 @@ def edm_sample(
         x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * torch.randn_like(x_cur)
         
         sigma_batch = torch.full((B,), t_hat.item(), device=device, dtype=torch.float32)
-        denoised_cond = edm_precond(model, x_hat.float(), mri, sigma_batch, sigma_data).double()
+        denoised_cond = edm_precond(model, x_hat.float(), mri, sigma_batch, sigma_data, mask=mask).double()
         
         # Classifier-free guidance (standard or CFG++)
         if current_cfg_scale != 1.0:
-            denoised_uncond = edm_precond(model, x_hat.float(), mri_uncond, sigma_batch, sigma_data).double()
+            denoised_uncond = edm_precond(model, x_hat.float(), mri_uncond, sigma_batch, sigma_data, mask=mask).double()
             
             if use_cfg_plus_plus:
                 denoised = apply_cfg_plus_plus(denoised_cond, denoised_uncond, 
@@ -915,11 +957,11 @@ def edm_sample(
         # Heun's 2nd order correction
         if i < num_steps - 1 and t_next > 0:
             sigma_batch = torch.full((B,), t_next.item(), device=device, dtype=torch.float32)
-            denoised_cond_next = edm_precond(model, x_next.float(), mri, sigma_batch, sigma_data).double()
+            denoised_cond_next = edm_precond(model, x_next.float(), mri, sigma_batch, sigma_data, mask=mask).double()
             
             # CFG for Heun correction
             if current_cfg_scale != 1.0:
-                denoised_uncond_next = edm_precond(model, x_next.float(), mri_uncond, sigma_batch, sigma_data).double()
+                denoised_uncond_next = edm_precond(model, x_next.float(), mri_uncond, sigma_batch, sigma_data, mask=mask).double()
                 
                 if use_cfg_plus_plus:
                     denoised_next = apply_cfg_plus_plus(denoised_cond_next, denoised_uncond_next,
@@ -965,6 +1007,9 @@ def edm_sample(
 
 def train(cfg: dict):
     """Main training function with Accelerate."""
+    
+    # Performance: enable cuDNN auto-tuner for fixed input sizes
+    torch.backends.cudnn.benchmark = True
     
     # Create output directory
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1020,14 +1065,14 @@ def train(cfg: dict):
             dropout=cfg["dropout"],
             drop_path_rate=cfg["drop_path"],
             gradient_checkpoint=cfg.get("gradient_checkpoint", False),
+            attention_type=cfg.get("attention_type", "window"),
+            deformable_kwargs=cfg.get("deformable_kwargs", None),
         )
     else:
         model = create_swin_fir_unet(
             config=cfg["model_config"],
             in_channels=2,
-            out_channels=1,
         )
-    
     if accelerator.is_main_process:
         total_params = sum(p.numel() for p in model.parameters())
         print(f"Model parameters: {total_params/1e6:.2f}M")
@@ -1088,6 +1133,8 @@ def train(cfg: dict):
         transform=train_transforms,
         target_size=cfg["image_size"],
         use_body_mask=use_body_mask,
+        cache_volumes=True,
+        mode="train",
     )
     
     if accelerator.is_main_process:
@@ -1099,7 +1146,8 @@ def train(cfg: dict):
         shuffle=True,
         num_workers=cfg["num_workers"],
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        persistent_workers=cfg["num_workers"] > 0,
     )
     
     if accelerator.is_main_process:
@@ -1113,6 +1161,8 @@ def train(cfg: dict):
             transform=val_transforms,
             target_size=cfg["image_size"],
             use_body_mask=use_body_mask,
+            cache_volumes=True,
+            mode="val",
         )
         val_loader = DataLoader(
             val_dataset,
@@ -1120,6 +1170,7 @@ def train(cfg: dict):
             shuffle=True,
             num_workers=cfg["num_workers"],
             pin_memory=True,
+            persistent_workers=cfg["num_workers"] > 0,
         )
     
     # Learning rate scheduler (lr_lambda defined here, scheduler created after prepare for FSDP)
@@ -1138,6 +1189,12 @@ def train(cfg: dict):
     if not is_fsdp:
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
+    # Optional: torch.compile for kernel fusion (may conflict with deformable attention)
+    if cfg.get("compile_model", False):
+        if accelerator.is_main_process:
+            print("Compiling model with torch.compile (mode='reduce-overhead')...")
+        model = torch.compile(model, mode="reduce-overhead")
+
     # Prepare with Accelerate
     if accelerator.is_main_process:
         print("Preparing model and data with Accelerator...")
@@ -1231,6 +1288,14 @@ def train(cfg: dict):
         model.train()
         epoch_loss = 0.0
         num_batches = 0
+
+        # Linearly decay cond_drop_prob from initial value to 0.0
+        cond_drop_start = cfg.get("cond_drop_prob", 0.0)
+        cond_drop_end_epoch = cfg.get("cond_drop_prob_end_epoch", 40)
+        if cond_drop_end_epoch > 0 and cond_drop_start > 0:
+            cond_drop_prob = max(0.0, cond_drop_start * (1.0 - epoch / cond_drop_end_epoch))
+        else:
+            cond_drop_prob = cond_drop_start
         
         pbar = tqdm(
             train_loader,
@@ -1238,7 +1303,14 @@ def train(cfg: dict):
             disable=not accelerator.is_main_process
         )
         
+        _t_data = 0.0
+        _t_fwd = 0.0
+        _t_bwd = 0.0
+        _t_step_start = time.time()
+
         for batch_idx, batch in enumerate(pbar):
+            _t_data += time.time() - _t_step_start  # data loading time
+
             mr = batch["mr"]
             ct = batch["ct"]
             # Get body mask if available (nnsyn-style training)
@@ -1254,12 +1326,13 @@ def train(cfg: dict):
                 device=accelerator.device,
             )
             
+            _t0 = time.time()
             with accelerator.accumulate(model):
                 loss, metrics = edm_loss(
                     model, ct, mr, sigma,
                     sigma_data=cfg["sigma_data"],
                     loss_type=cfg["loss_type"],
-                    cond_drop_prob=cfg.get("cond_drop_prob", 0.0),
+                    cond_drop_prob=cond_drop_prob,
                     use_masked_loss=cfg.get("use_masked_loss", False),
                     masked_loss_ratio=cfg.get("masked_loss_ratio", 0.6),
                     mask_threshold=cfg.get("mask_threshold", -0.7),
@@ -1267,7 +1340,9 @@ def train(cfg: dict):
                     D=cfg.get("D", 128),
                     body_mask=body_mask,  # Pass body mask to loss function
                 )
-                
+                _t_fwd += time.time() - _t0
+
+                _t0 = time.time()
                 accelerator.backward(loss)
                 
                 if cfg["grad_clip"] and cfg["grad_clip"] > 0:
@@ -1276,6 +1351,7 @@ def train(cfg: dict):
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+                _t_bwd += time.time() - _t0
                 
                 # Update EMA weights
                 if ema is not None and global_step % cfg.get("ema_update_every", 1) == 0:
@@ -1283,10 +1359,12 @@ def train(cfg: dict):
             
             epoch_loss += loss.item()
             num_batches += 1
+            _t_step_start = time.time()  # reset for next data-load timing
             
             pbar.set_postfix({
                 "loss": f"{loss.item():.3e}",
-                "lr": f"{scheduler.get_last_lr()[0]:.2e}"
+                "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+                "cdp": f"{cond_drop_prob:.3f}",
             })
             
             if batch_idx % cfg["log_every"] == 0:
@@ -1300,6 +1378,7 @@ def train(cfg: dict):
                     "train/sigma_max": metrics['sigma_max'],
                     "train/sigma_min": metrics['sigma_min'],
                     "train/masked": metrics['masked'],
+                    "train/cond_drop_prob": cond_drop_prob,
                 }
                 # Add mask ratio if masking was used
                 if 'mask_ratio' in metrics:
@@ -1341,6 +1420,10 @@ def train(cfg: dict):
         
         if accelerator.is_main_process:
             print(f"\nEpoch {epoch+1}: avg_loss={avg_loss:.3e}, time={epoch_time:.1f}s")
+            if num_batches > 0:
+                print(f"  Timing breakdown: data={_t_data/num_batches:.3f}s  "
+                      f"fwd={_t_fwd/num_batches:.3f}s  "
+                      f"bwd+step={_t_bwd/num_batches:.3f}s  per iter")
         
         # Sample generation
         if (epoch + 1) % cfg["sample_every"] == 0:
@@ -1380,6 +1463,10 @@ def train(cfg: dict):
                             sigma_max=cfg["sigma_max"],
                             sigma_data=cfg["sigma_data"],
                             rho=cfg["rho"],
+                            S_churn=cfg.get("S_churn", 0.0),
+                            S_min=cfg.get("S_min", 0.0),
+                            S_max=cfg.get("S_max", float('inf')),
+                            S_noise=cfg.get("S_noise", 1.0),
                             return_trajectory_stats=True,
                             cfg_scale=cfg.get("cfg_scale", 1.0),
                             pfgmpp=cfg.get("pfgmpp", False),
@@ -1390,6 +1477,7 @@ def train(cfg: dict):
                             use_dynamic_cfg=cfg.get("use_dynamic_cfg", False),
                             cfg_scale_min=cfg.get("cfg_scale_min", 1.0),
                             cfg_scale_max=cfg.get("cfg_scale_max", 3.0),
+                            mask=sample_mask,
                         )
                         # Log ODE trajectory stats
                         accelerator.log({
@@ -1407,6 +1495,10 @@ def train(cfg: dict):
                             sigma_max=cfg["sigma_max"],
                             sigma_data=cfg["sigma_data"],
                             rho=cfg["rho"],
+                            S_churn=cfg.get("S_churn", 0.0),
+                            S_min=cfg.get("S_min", 0.0),
+                            S_max=cfg.get("S_max", float('inf')),
+                            S_noise=cfg.get("S_noise", 1.0),
                             cfg_scale=cfg.get("cfg_scale", 1.0),
                             pfgmpp=cfg.get("pfgmpp", False),
                             D=cfg.get("D", 128),
@@ -1416,6 +1508,7 @@ def train(cfg: dict):
                             use_dynamic_cfg=cfg.get("use_dynamic_cfg", False),
                             cfg_scale_min=cfg.get("cfg_scale_min", 1.0),
                             cfg_scale_max=cfg.get("cfg_scale_max", 3.0),
+                            mask=sample_mask,
                         )
                     
                     #pred_ct = torch.clamp(pred_ct, -3.0, 6.0)
@@ -1549,6 +1642,10 @@ def train(cfg: dict):
                     sigma_max=cfg["sigma_max"],
                     sigma_data=cfg["sigma_data"],
                     rho=cfg["rho"],
+                    S_churn=cfg.get("S_churn", 0.0),
+                    S_min=cfg.get("S_min", 0.0),
+                    S_max=cfg.get("S_max", float('inf')),
+                    S_noise=cfg.get("S_noise", 1.0),
                     cfg_scale=cfg.get("cfg_scale", 1.0),
                     pfgmpp=cfg.get("pfgmpp", False),
                     D=cfg.get("D", 128),
@@ -1563,11 +1660,13 @@ def train(cfg: dict):
                     pred_val_ct = edm_sample_tta(
                         unwrapped_model, mr_val_samples,
                         tta_flips=cfg.get("tta_flips", ["lr", "ud", "lr_ud"]),
+                        mask=val_sample_mask,
                         **val_sample_kwargs,
                     )
                 else:
                     pred_val_ct = edm_sample(
                         unwrapped_model, mr_val_samples,
+                        mask=val_sample_mask,
                         **val_sample_kwargs,
                     )
                 

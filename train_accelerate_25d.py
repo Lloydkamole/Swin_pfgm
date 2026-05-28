@@ -4,10 +4,19 @@ PFGM-FIR 2.5D Training Script with Hugging Face Accelerate.
 Trains a 2.5D model using 3D convolutions on small volumetric patches.
 Multi-GPU training support with FSDP.
 
+Full feature parity with train_accelerate.py (2D version):
+- PFGM++ (inverse-beta perturbation/sampling) adapted for 5D tensors
+- EMA (Exponential Moving Average) for smoother weights
+- CFG++ (manifold-constrained guidance) with dynamic scaling
+- Test-Time Augmentation (spatial flips)
+- Body mask support (mask.nii loading)
+- Classifier-free guidance with linear decay
+
 Key differences from train_accelerate.py:
 - Uses 2.5D data loader (small volumetric patches)
 - Uses 3D convolutions throughout
 - Processes and predicts multiple slices simultaneously
+- All tensors are [B, C, D, H, W] (5D)
 
 Usage:
     # Single GPU:
@@ -23,6 +32,7 @@ Usage:
     accelerate launch --config_file accelerate_config_fsdp.yaml train_accelerate_25d.py
 """
 
+import gc
 import os
 import sys
 import math
@@ -69,71 +79,181 @@ except Exception:
 
 
 # =============================================================================
+# EMA (Exponential Moving Average)
+# =============================================================================
+
+class EMA:
+    """
+    Exponential Moving Average for model weights.
+    
+    Maintains a shadow copy of model parameters that are updated with
+    exponential moving average. This typically improves generation quality
+    by 1-3 dB PSNR in diffusion models.
+    
+    Usage:
+        ema = EMA(model, decay=0.9999)
+        
+        # In training loop after optimizer.step():
+        ema.update()
+        
+        # For inference/validation:
+        ema.apply_shadow()  # Use EMA weights
+        ... do inference ...
+        ema.restore()       # Restore original weights
+    """
+    
+    def __init__(self, model: nn.Module, decay: float = 0.9999, device: torch.device = None):
+        self.model = model
+        self.decay = decay
+        self.device = device
+        self.shadow = {}
+        self.backup = {}
+        self.num_updates = 0
+        self._init_shadow()
+    
+    def _init_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                if self.device is not None:
+                    self.shadow[name] = param.data.clone().to(self.device)
+                else:
+                    self.shadow[name] = param.data.clone()
+    
+    @torch.no_grad()
+    def update(self):
+        self.num_updates += 1
+        decay = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.shadow[name].mul_(decay).add_(param.data, alpha=1 - decay)
+    
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+    
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data.copy_(self.backup[name])
+        self.backup = {}
+    
+    def state_dict(self):
+        return {
+            'shadow': self.shadow,
+            'num_updates': self.num_updates,
+            'decay': self.decay,
+        }
+    
+    def load_state_dict(self, state_dict):
+        self.shadow = state_dict['shadow']
+        self.num_updates = state_dict['num_updates']
+        self.decay = state_dict.get('decay', self.decay)
+
+
+# =============================================================================
 # CONFIGURATION
 # =============================================================================
 
 config = {
     # Data Settings
-    "data_dir": "/home/lloyd/Documents/AR PFGM/pfgm_train",
+    "data_dir": "/mnt/nvme/lloyd/DL project CT-MRI/pfgm_brain_train_n",
     "mr_pattern": "mr.nii",
     "ct_pattern": "ct.nii",
     "train_split": 0.9,
     "image_size": 256,
     
     # 2.5D Settings
-    "num_slices": 8,           # Number of consecutive slices (divisible by 2 for attention)
-    "slice_stride": 4,         # Stride between volume centers (None = non-overlapping)
+    "num_slices": 4,           # Number of consecutive slices (divisible by 2 for attention)
+    "slice_stride": 2,         # Stride between volume centers (None = non-overlapping)
     
     # Model Architecture
     "base_channels": 64,
     "channel_mults": [1, 2, 3, 4],  # 4 stages with 64, 128, 192, 256 channels
-    "attention_resolutions": [2, 3, 4],  # Attention when mult in [3,4] → stages 2,3
+    "attention_resolutions": [3, 4],  # Attention when mult in [3,4] → stages 2,3
     "num_res_blocks": 2,
     "num_heads": 4,
     "mlp_ratio": 4.0,
     "radius_emb_dim": 256,
     "window_size": 4,  # Spatial window size (H, W) - fallback only
     # Multi-resolution window sizes per stage
-    # Stage 0 (8×256×256, 64ch, mult=1): NO attention
-    # Stage 1 (4×128×128, 128ch, mult=2): NO attention
-    # Stage 2 (2×64×64, 192ch, mult=3): WITH attention (mult in [3,4])
-    # Stage 3 (1×32×32, 256ch, mult=4): WITH attention (mult in [3,4])
     "window_size_3d": {
         1: [2, 4, 4],
-        2: [1, 4, 4],   # Stage 2: 192 channels, attention enabled
+        2: [2, 4, 4],   # Stage 2: 192 channels, attention enabled
         3: [1, 4, 4],   # Stage 3: 256 channels, attention enabled
     },
     "dropout": 0.0,
-    
-    # EDM Parameters
+    "drop_path": 0.1,                    # Stochastic depth rate (matches 2D)
+    "gradient_checkpoint": True,  # Trade ~30% speed for ~60% activation memory savings
+
+    # SwinFIR / Attention architecture (mirrors 2D `train_accelerate.py`)
+    "num_heads": 8,
+    "mlp_ratio": 4.0,
+    "num_swin_blocks": 2,                # Attention blocks per FIRResBlock3D
+    "num_sfb_blocks": 1,                 # 3D SFB blocks per FIRResBlock3D
+    "num_bottleneck_blocks": 2,          # FIRResBlock3D count in bottleneck
+    "use_sfb": True,                     # Enable 3D Spatial-Frequency Blocks
+    "attention_type": "deformable",      # 'window' | 'deformable' (3D DAT++)
+    "deformable_kwargs": {               # Forwarded to DeformableAttention3D
+        "n_groups": 4,
+        "kv_stride": 2,                  # Downsample only H,W (depth preserved)
+        "offset_range_factor": 4.0,
+        "use_qk_norm": True,
+    },
+
+    # EDM Parameters (mirrors 2D)
     "sigma_min": 0.002,
     "sigma_max": 80.0,
-    "sigma_data": 0.5,
-    "P_mean": -1.2,
-    "P_std": 1.2,
+    "sigma_data": 0.45,
+    "P_mean": -0.8,
+    "P_std": 1.0,
     "rho": 7.0,
-    "loss_type": "l2",  # Match 2D implementation
+    "loss_type": "l2",
+
+    # EDM Stochastic Sampler (Heun + S_churn)
+    "S_churn": 20.0,
+    "S_min": 0.0,
+    "S_max": float('inf'),
+    "S_noise": 1.0,
+
+    # PFGM++ Parameters
+    "pfgmpp": True,                      # Enable PFGM++ mode (vs pure EDM)
+    "D": 128,                            # Augmented dimension for PFGM++ (D→∞ recovers EDM)
+
+    # Classifier-Free Guidance (CFG) — matches 2D defaults
+    "cond_drop_prob": 0.1,               # Initial probability of dropping MRI conditioning
+    "cond_drop_prob_end_epoch": 0,       # 0 = constant drop rate (no decay)
+    "cfg_scale": 2.0,                    # Guidance scale at inference
+
+    # CFG++ and Dynamic Scaling (for sampling/generation)
+    "use_cfg_plus_plus": True,           # Use CFG++ manifold constraints
+    "cfg_rescale_factor": 0.7,           # Rescale factor for CFG++
+    "use_dynamic_cfg": True,             # Use dynamic CFG scaling
+    "cfg_scale_min": 1.0,               # Minimum CFG scale (at end of sampling)
+    "cfg_scale_max": 2.0,               # Maximum CFG scale (at start of sampling)
     
-    # Classifier-Free Guidance (CFG)
-    "cond_drop_prob": 0.2,
-    "cfg_scale": 3.0,
-    
-    # Masked Loss
-    "use_masked_loss": True,
+    # Masked Loss (Anatomical Focusing)
+    "use_masked_loss": False,
     "masked_loss_ratio": 0.5,
     "mask_threshold": -0.7,
     
+    # Body Mask Training (nnsyn-style anatomically-focused training)
+    "use_body_mask": True,               # Enable body mask loading and masked training
+    "mask_pattern": "mask.nii",          # Suffix pattern to match mask files
+    "mask_outside_value": -1.0,          # Value for regions outside the mask
+    
     # Training Parameters
     "num_epochs": 100,
-    "batch_size": 2,  # Smaller batch size for 3D convolutions
-    "lr": 5e-5,  # Balanced: not too low, not too high
+    "batch_size": 8,  # Smaller batch size for 3D convolutions
+    "lr": 1e-4,  # Matches 2D canonical
     "weight_decay": 0.01,
-    "grad_clip": None,  # Gentler clipping
-    "warmup_steps": 1000,  # Moderate warmup
+    "grad_clip": 1.0,  # Matches 2D canonical
+    "warmup_steps": 500,  # Matches 2D canonical
     
     # Sampling / Generation
-    "num_sample_steps": 50,
-    "num_val_samples": 2,  # Fewer samples for visualization
+    "num_sample_steps": 30,
+    "num_val_samples": 3,  # Fewer samples for visualization
     
     # Logging & Checkpointing
     "output_dir": "./outputs_accelerate_25d",
@@ -150,8 +270,17 @@ config = {
     
     # System
     "seed": 42,
-    "num_workers": 4,
-    "mixed_precision": "no",  # "no", "fp16", or "bf16"
+    "num_workers": 8,
+    "mixed_precision": "bf16",  # "no", "fp16", or "bf16" — bf16 halves memory usage
+    
+    # EMA (Exponential Moving Average)
+    "use_ema": True,                     # Enable EMA for smoother weights
+    "ema_decay": 0.9999,                 # EMA decay rate
+    "ema_update_every": 1,               # Update EMA every N steps
+    
+    # Test-Time Augmentation (TTA) for validation generation
+    "use_tta": False,                    # Enable Flip TTA during val generation (4x slower)
+    "tta_flips": ["lr", "ud", "lr_ud"], # Which flips (spatial only, no depth)
 }
 
 
@@ -159,8 +288,9 @@ config = {
 # Utility Functions
 # =============================================================================
 
-def collect_data_files(data_path: str, mr_pattern: str = "mr.nii", ct_pattern: str = "ct.nii"):
-    """Collect MR and CT file pairs from directory structure."""
+def collect_data_files(data_path: str, mr_pattern: str = "mr.nii", ct_pattern: str = "ct.nii",
+                       mask_pattern: str = "mask.nii", use_body_mask: bool = False):
+    """Collect MR, CT, and optionally mask file pairs from directory structure."""
     data_files = []
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"Data path not found: {data_path}")
@@ -172,14 +302,22 @@ def collect_data_files(data_path: str, mr_pattern: str = "mr.nii", ct_pattern: s
         
         mr_file = None
         ct_file = None
+        mask_file = None
         for filename in os.listdir(patient_path):
             if mr_pattern in filename:
                 mr_file = os.path.join(patient_path, filename)
             if ct_pattern in filename:
                 ct_file = os.path.join(patient_path, filename)
+            if use_body_mask and mask_pattern in filename:
+                mask_file = os.path.join(patient_path, filename)
         
         if mr_file and ct_file:
-            data_files.append({"mr": mr_file, "ct": ct_file, "id": patient_dir})
+            entry = {"mr": mr_file, "ct": ct_file, "id": patient_dir}
+            if use_body_mask:
+                entry["mask"] = mask_file  # Can be None if not found
+                if mask_file is None:
+                    print(f"Warning: No mask found for patient {patient_dir}")
+            data_files.append(entry)
     
     return data_files
 
@@ -198,7 +336,7 @@ def check_gradient_flow(named_parameters):
 
 
 # =============================================================================
-# EDM Functions (adapted for 2.5D)
+# EDM Functions (adapted for 2.5D — 5D tensors)
 # =============================================================================
 
 def edm_precond(
@@ -207,6 +345,7 @@ def edm_precond(
     mri: torch.Tensor,
     sigma: torch.Tensor,
     sigma_data: float = 0.5,
+    mask: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Apply EDM preconditioning to model output (2.5D version).
@@ -215,6 +354,8 @@ def edm_precond(
         x: Noisy CT volume [B, 1, D, H, W]
         mri: MRI condition volume [B, 1, D, H, W]
         sigma: Noise level [B]
+        mask: Optional body mask [B, 1, D, H, W] threaded to the model so
+              deformable attention can suppress background K/V.
     """
     x = x.float()
     mri = mri.float()
@@ -227,7 +368,7 @@ def edm_precond(
     c_noise = sigma.log() / 4  # [B] - FourierEmbedding handles reshaping
     
     x_scaled = c_in * x
-    F_x = model(x_scaled, mri, c_noise)
+    F_x = model(x_scaled, mri, c_noise, mask=mask)
     D_x = c_skip * x + c_out * F_x
     
     return D_x
@@ -248,6 +389,149 @@ def sample_sigma(
     return sigma
 
 
+# =============================================================================
+# PFGM++ Functions (adapted for 5D tensors [B, C, D, H, W])
+# =============================================================================
+
+def pfgmpp_perturbation(
+    images: torch.Tensor,
+    sigma: torch.Tensor,
+    D: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply PFGM++ perturbation using inverse-beta (beta-prime) distribution.
+    Adapted for 5D tensors [B, C, D_slices, H, W].
+    
+    Args:
+        images: Clean volumes [B, C, D_slices, H, W]
+        sigma: Noise levels [B]
+        D: Augmented dimension (D→∞ recovers Gaussian diffusion)
+    
+    Returns:
+        perturbed_images: Volumes with PFGM++ noise [B, C, D_slices, H, W]
+        used_sigmas: The sigma values used (for embedding)
+    """
+    B = images.shape[0]
+    N = images[0].numel()  # Data dimension (C*D_slices*H*W)
+    device = images.device
+    
+    # r = sigma * sqrt(D) - the PFGM++ transfer formula
+    r = sigma.double() * np.sqrt(D)
+    
+    # Sample from inverse-beta (beta-prime) distribution — GPU-native (no host
+    # sync). Mirrors the canonical 2D `train_accelerate.py` path.
+    beta_dist = torch.distributions.Beta(
+        torch.tensor(N / 2.0, device=device, dtype=torch.float64),
+        torch.tensor(D / 2.0, device=device, dtype=torch.float64),
+    )
+    samples_norm = beta_dist.sample((B,))
+    inverse_beta = samples_norm / (1 - samples_norm + 1e-8)
+    
+    # Radius = r * sqrt(inverse_beta)
+    radius = r * torch.sqrt(inverse_beta + 1e-8)
+    
+    # Sample uniform direction on N-sphere via normalized Gaussian
+    gaussian = torch.randn(B, N, device=device, dtype=torch.float64)
+    unit_gaussian = gaussian / (torch.norm(gaussian, p=2, dim=1, keepdim=True) + 1e-8)
+    
+    # Perturbation = unit_direction * radius
+    perturbation = unit_gaussian * radius.view(B, 1)
+    
+    # Reshape back to volume shape and add to clean images
+    perturbation = perturbation.view_as(images).float()
+    perturbed_images = images + perturbation
+    
+    return perturbed_images, sigma
+
+
+def pfgmpp_target(
+    perturbed_images: torch.Tensor,
+    clean_images: torch.Tensor,
+    sigma: torch.Tensor,
+    D: int = 128,
+) -> torch.Tensor:
+    """
+    Compute PFGM++ Poisson field target.
+    Adapted for 5D tensors [B, C, D_slices, H, W].
+    
+    The target is the clean image (denoising target), same as EDM,
+    but the perturbation and loss weighting differ.
+    
+    Args:
+        perturbed_images: Noisy volumes [B, C, D_slices, H, W]
+        clean_images: Clean target volumes [B, C, D_slices, H, W]
+        sigma: Noise levels [B]
+        D: Augmented dimension
+    
+    Returns:
+        target: PFGM++ target [B, C, D_slices, H, W]
+    """
+    return clean_images
+
+
+def pfgmpp_sample_prior(
+    batch_size: int,
+    channels: int,
+    depth: int,
+    height: int,
+    width: int,
+    sigma_max: float,
+    D: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float64,
+) -> torch.Tensor:
+    """
+    Sample from PFGM++ prior distribution for sampling initialization.
+    Adapted for 5D tensors [B, C, D_slices, H, W].
+    
+    Instead of Gaussian N(0, sigma_max^2), PFGM++ uses:
+    - Radius from inverse-beta distribution
+    - Direction uniform on N-sphere
+    
+    Args:
+        batch_size: Number of samples
+        channels, depth, height, width: Volume dimensions
+        sigma_max: Maximum sigma (converted to r_max = sigma_max * sqrt(D))
+        D: Augmented dimension
+        device: Target device
+        dtype: Target dtype
+    
+    Returns:
+        Initial latents for sampling [B, C, D_slices, H, W]
+    """
+    N = channels * depth * height * width  # Data dimension
+    
+    # r_max = sigma_max * sqrt(D)
+    r_max = sigma_max * np.sqrt(D)
+    
+    # Sample from inverse-beta distribution — GPU-native (no host sync).
+    beta_dist = torch.distributions.Beta(
+        torch.tensor(N / 2.0, device=device, dtype=torch.float64),
+        torch.tensor(D / 2.0, device=device, dtype=torch.float64),
+    )
+    samples_norm = beta_dist.sample((batch_size,))
+    inverse_beta = samples_norm / (1 - samples_norm + 1e-8)
+    
+    # Radius = r_max * sqrt(inverse_beta)
+    radius = r_max * torch.sqrt(inverse_beta + 1e-8)
+    
+    # Sample uniform direction on N-sphere
+    gaussian = torch.randn(batch_size, N, device=device, dtype=torch.float64)
+    unit_gaussian = gaussian / (torch.norm(gaussian, p=2, dim=1, keepdim=True) + 1e-8)
+    
+    # Initial latent = unit_direction * radius
+    latent = unit_gaussian * radius.view(batch_size, 1)
+    
+    # Reshape to volume
+    latent = latent.view(batch_size, channels, depth, height, width).to(dtype)
+    
+    return latent
+
+
+# =============================================================================
+# Loss Function
+# =============================================================================
+
 def edm_loss(
     model: nn.Module,
     x_clean: torch.Tensor,
@@ -259,17 +543,31 @@ def edm_loss(
     use_masked_loss: bool = False,
     masked_loss_ratio: float = 0.6,
     mask_threshold: float = -0.7,
+    pfgmpp: bool = False,
+    D: int = 128,
+    body_mask: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    Compute EDM-style loss for 2.5D model.
+    Compute EDM/PFGM++ loss for 2.5D model with optional masking.
+    
+    Supports two masking modes:
+    1. Threshold-based: Generate mask from CT (use_masked_loss=True, body_mask=None)
+    2. Body mask: Use explicit body contour mask from dataloader (body_mask not None)
     
     Args:
         x_clean: Clean CT volume [B, 1, D, H, W]
         mri: MRI condition volume [B, 1, D, H, W]
         sigma: Noise levels [B]
+        pfgmpp: If True, use PFGM++ perturbation instead of Gaussian
+        D: Augmented dimension for PFGM++
+        body_mask: Optional explicit body mask [B, 1, D, H, W] from dataloader
     """
-    n = torch.randn_like(x_clean) * sigma.view(-1, 1, 1, 1, 1)
-    x_noisy = x_clean + n
+    # Apply perturbation: PFGM++ (inverse-beta) or EDM (Gaussian)
+    if pfgmpp:
+        x_noisy, sigma = pfgmpp_perturbation(x_clean, sigma, D=D)
+    else:
+        n = torch.randn_like(x_clean) * sigma.view(-1, 1, 1, 1, 1)
+        x_noisy = x_clean + n
     
     # Classifier-free guidance: randomly drop conditioning
     if cond_drop_prob > 0.0 and model.training:
@@ -277,20 +575,25 @@ def edm_loss(
         mri = mri.clone()
         mri[drop_mask] = 0.0
     
-    D_x = edm_precond(model, x_noisy, mri, sigma, sigma_data)
+    D_x = edm_precond(model, x_noisy, mri, sigma, sigma_data, mask=body_mask)
     
     sigma_v = sigma.view(-1, 1, 1, 1, 1)
     weight = (sigma_v ** 2 + sigma_data ** 2) / ((sigma_v * sigma_data) ** 2)
-    weight = weight.clamp(max=30.0)  # Balanced clamping
+    weight = weight.clamp(max=1000.0)
     
-    # Generate body mask if using masked loss
-    body_mask = None
+    # Apply body mask if provided (nnsyn-style masked training)
+    mask_used = None
     use_mask_this_batch = False
-    if use_masked_loss and model.training:
+    
+    if body_mask is not None:
+        use_mask_this_batch = True
+        mask_used = body_mask
+        weight = weight * body_mask
+    elif use_masked_loss and model.training:
         if torch.rand(1).item() < masked_loss_ratio:
             use_mask_this_batch = True
-            body_mask = (x_clean > mask_threshold).float()
-            weight = weight * body_mask
+            mask_used = (x_clean > mask_threshold).float()
+            weight = weight * mask_used
     
     if loss_type == 'l1':
         loss = (weight * (D_x - x_clean).abs()).mean()
@@ -303,7 +606,17 @@ def edm_loss(
     
     # Metrics for logging
     with torch.no_grad():
-        mse = F.mse_loss(D_x, x_clean).item()
+        if mask_used is not None:
+            masked_pred = D_x * mask_used
+            masked_target = x_clean * mask_used
+            num_masked_pixels = mask_used.sum()
+            if num_masked_pixels > 0:
+                mse = ((masked_pred - masked_target) ** 2).sum() / num_masked_pixels
+                mse = mse.item()
+            else:
+                mse = F.mse_loss(D_x, x_clean).item()
+        else:
+            mse = F.mse_loss(D_x, x_clean).item()
         pred_std = D_x.std().item()
         target_std = x_clean.std().item()
     
@@ -316,14 +629,174 @@ def edm_loss(
         'sigma_min': sigma.min().item(),
     }
     
-    if use_mask_this_batch and body_mask is not None:
-        metrics['mask_ratio'] = body_mask.mean().item()
+    if use_mask_this_batch and mask_used is not None:
+        metrics['mask_ratio'] = mask_used.mean().item()
         metrics['masked'] = 1.0
     else:
         metrics['masked'] = 0.0
     
     return loss, metrics
 
+
+# =============================================================================
+# Metrics
+# =============================================================================
+
+def compute_masked_metrics(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor = None,
+    psnr_metric=None,
+    ssim_metric=None,
+    mae_metric=None,
+) -> Dict[str, float]:
+    """
+    Compute image quality metrics with optional masking (nnsyn-style).
+    Works on 2D center slices [B, C, H, W] extracted from 5D volumes.
+    
+    Args:
+        pred: Predicted image [B, C, H, W] in [0, 1] range
+        target: Target image [B, C, H, W] in [0, 1] range
+        mask: Binary body mask [B, C, H, W] (1=body, 0=outside)
+    """
+    metrics = {}
+    
+    # Reset torchmetrics state to avoid accumulating across calls (mirrors 2D)
+    if psnr_metric is not None:
+        psnr_metric.reset()
+    if ssim_metric is not None:
+        ssim_metric.reset()
+    if mae_metric is not None:
+        mae_metric.reset()
+    
+    if mask is not None:
+        pred_masked = pred * mask
+        target_masked = target * mask
+    else:
+        pred_masked = pred
+        target_masked = target
+    
+    if psnr_metric is not None:
+        psnr_val = psnr_metric(pred_masked, target_masked)
+        metrics['psnr'] = psnr_val.item()
+    
+    if ssim_metric is not None:
+        if mask is not None:
+            pred_for_ssim = pred * mask + (1 - mask) * 0.0
+            target_for_ssim = target * mask + (1 - mask) * 0.0
+            ssim_val = ssim_metric(pred_for_ssim, target_for_ssim)
+        else:
+            ssim_val = ssim_metric(pred_masked, target_masked)
+        metrics['ssim'] = ssim_val.item()
+    
+    if mae_metric is not None:
+        if mask is not None:
+            num_masked = mask.sum()
+            if num_masked > 0:
+                mae_val = (pred_masked - target_masked).abs().sum() / num_masked
+                metrics['mae'] = mae_val.item()
+            else:
+                metrics['mae'] = mae_metric(pred, target).item()
+        else:
+            mae_val = mae_metric(pred_masked, target_masked)
+            metrics['mae'] = mae_val.item()
+    
+    return metrics
+
+
+# =============================================================================
+# CFG++ and TTA
+# =============================================================================
+
+def apply_cfg_plus_plus(denoised_cond: torch.Tensor, denoised_uncond: torch.Tensor, 
+                         cfg_scale: float, rescale_factor: float = 0.7) -> torch.Tensor:
+    """
+    Apply CFG++ with manifold constraints (rescaling).
+    Adapted for 5D tensors [B, C, D, H, W].
+    
+    Standard CFG can push samples off the data manifold, causing oversaturation.
+    CFG++ rescales the output to match the statistics of the conditional prediction.
+    """
+    # Standard CFG
+    denoised_cfg = denoised_uncond + cfg_scale * (denoised_cond - denoised_uncond)
+    
+    if rescale_factor > 0:
+        # Compute std of conditional and CFG outputs (per sample, over C,D,H,W)
+        std_cond = denoised_cond.std(dim=[1, 2, 3, 4], keepdim=True)
+        std_cfg = denoised_cfg.std(dim=[1, 2, 3, 4], keepdim=True)
+        
+        # Rescale CFG output to match conditional std
+        rescale = std_cond / (std_cfg + 1e-8)
+        
+        # Interpolate between standard CFG and rescaled CFG
+        denoised_cfg = rescale_factor * (denoised_cfg * rescale) + (1 - rescale_factor) * denoised_cfg
+    
+    return denoised_cfg
+
+
+def _flip_tensor(x: torch.Tensor, flip_type: str) -> torch.Tensor:
+    """Flip a tensor spatially (works on both 4D and 5D). Spatial flips only."""
+    if flip_type == "lr":
+        return torch.flip(x, dims=[-1])       # left-right (flip W)
+    elif flip_type == "ud":
+        return torch.flip(x, dims=[-2])       # up-down (flip H)
+    elif flip_type == "lr_ud":
+        return torch.flip(x, dims=[-2, -1])   # both
+    else:
+        raise ValueError(f"Unknown flip type: {flip_type}")
+
+
+@torch.no_grad()
+def edm_sample_tta(
+    model: nn.Module,
+    mri: torch.Tensor,
+    tta_flips: list = ("lr", "ud", "lr_ud"),
+    **sample_kwargs,
+) -> torch.Tensor:
+    """
+    Flip Test-Time Augmentation wrapper around edm_sample.
+    
+    Runs the sampler on the original input + each flipped version,
+    flips predictions back to the original orientation, then averages.
+    Spatial flips only (H, W dims) — no depth flipping.
+    
+    Args:
+        model: Denoising model
+        mri: Conditioning MRI volumes [B, 1, D, H, W]
+        tta_flips: List of flip types: "lr", "ud", "lr_ud"
+    
+    Returns:
+        Averaged CT prediction [B, 1, D, H, W]
+    """
+    sample_kwargs_no_stats = {k: v for k, v in sample_kwargs.items()
+                              if k != 'return_trajectory_stats'}
+    sample_kwargs_no_stats['return_trajectory_stats'] = False
+
+    # Extract mask so we can flip it alongside the MRI for each TTA pass.
+    mask = sample_kwargs_no_stats.pop('mask', None)
+
+    # 1) Original (unflipped) prediction
+    pred_original = edm_sample(model, mri, mask=mask, **sample_kwargs_no_stats)
+    preds = [pred_original]
+
+    # 2) Flipped predictions (flip mask in lockstep with MRI)
+    for flip_type in tta_flips:
+        mri_flipped = _flip_tensor(mri, flip_type)
+        mask_flipped = _flip_tensor(mask, flip_type) if mask is not None else None
+        pred_flipped = edm_sample(
+            model, mri_flipped, mask=mask_flipped, **sample_kwargs_no_stats
+        )
+        pred_unflipped = _flip_tensor(pred_flipped, flip_type)
+        preds.append(pred_unflipped)
+
+    # 3) Average all predictions
+    pred_avg = torch.stack(preds, dim=0).mean(dim=0)
+    return pred_avg
+
+
+# =============================================================================
+# Sampling
+# =============================================================================
 
 @torch.no_grad()
 def edm_sample(
@@ -340,23 +813,58 @@ def edm_sample(
     S_noise: float = 1.0,
     return_trajectory_stats: bool = False,
     cfg_scale: float = 1.0,
+    pfgmpp: bool = False,
+    D: int = 128,
+    # CFG++ and Dynamic Scaling options
+    use_cfg_plus_plus: bool = False,
+    cfg_rescale_factor: float = 0.7,
+    use_dynamic_cfg: bool = False,
+    cfg_scale_min: float = 1.0,
+    cfg_scale_max: float = 3.0,
+    mask: torch.Tensor = None,
 ) -> torch.Tensor:
     """
-    Generate CT volumes from MRI using EDM sampling (2.5D version).
+    Generate CT volumes from MRI using EDM/PFGM++ sampling (2.5D version).
+    
+    Enhanced with:
+    - CFG++ (manifold constraints)
+    - Dynamic CFG scaling
+    - PFGM++ prior initialization
     
     Args:
         mri: MRI condition volume [B, 1, D, H, W]
         return_trajectory_stats: If True, returns (samples, stats_dict)
         cfg_scale: Classifier-free guidance scale
+        pfgmpp: If True, use PFGM++ prior for initialization
+        D: Augmented dimension for PFGM++
+        use_cfg_plus_plus: Enable CFG++ manifold constraints
+        cfg_rescale_factor: Rescale factor for CFG++
+        use_dynamic_cfg: Enable dynamic CFG scaling
+        cfg_scale_min: Minimum CFG scale (at end of sampling)
+        cfg_scale_max: Maximum CFG scale (at start of sampling)
     """
-    B, C, D, H, W = mri.shape
+    B, C, Ds, H, W = mri.shape
     device = mri.device
     
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=device)
     t_steps = (sigma_max ** (1/rho) + step_indices / (num_steps - 1) * (sigma_min ** (1/rho) - sigma_max ** (1/rho))) ** rho
     t_steps = torch.cat([t_steps, torch.zeros_like(t_steps[:1])])
     
-    x_next = torch.randn(B, 1, D, H, W, device=device, dtype=torch.float64) * t_steps[0]
+    # Initialize latents: PFGM++ prior or Gaussian
+    if pfgmpp:
+        x_next = pfgmpp_sample_prior(
+            batch_size=B,
+            channels=1,  # CT output channels
+            depth=Ds,
+            height=H,
+            width=W,
+            sigma_max=sigma_max,
+            D=D,
+            device=device,
+            dtype=torch.float64,
+        )
+    else:
+        x_next = torch.randn(B, 1, Ds, H, W, device=device, dtype=torch.float64) * t_steps[0]
     
     # Track ODE trajectory statistics
     traj_norms = [x_next.norm().item()]
@@ -364,8 +872,18 @@ def edm_sample(
     score_norms = []
     update_norms = []
     
+    # Precompute unconditional input for CFG
+    mri_uncond = torch.zeros_like(mri) if cfg_scale != 1.0 or use_dynamic_cfg else None
+    
     for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
         x_cur = x_next
+        
+        # Dynamic CFG: linearly interpolate from cfg_scale_max to cfg_scale_min
+        if use_dynamic_cfg:
+            progress = i / (num_steps - 1)  # 0 at start, 1 at end
+            current_cfg_scale = cfg_scale_max + progress * (cfg_scale_min - cfg_scale_max)
+        else:
+            current_cfg_scale = cfg_scale
         
         # Increase noise temporarily (stochasticity)
         gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
@@ -373,13 +891,17 @@ def edm_sample(
         x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * torch.randn_like(x_cur)
         
         sigma_batch = torch.full((B,), t_hat.item(), device=device, dtype=torch.float32)
-        denoised_cond = edm_precond(model, x_hat.float(), mri, sigma_batch, sigma_data).double()
+        denoised_cond = edm_precond(model, x_hat.float(), mri, sigma_batch, sigma_data, mask=mask).double()
         
-        # Classifier-free guidance
-        if cfg_scale != 1.0:
-            mri_uncond = torch.zeros_like(mri)
-            denoised_uncond = edm_precond(model, x_hat.float(), mri_uncond, sigma_batch, sigma_data).double()
-            denoised = denoised_uncond + cfg_scale * (denoised_cond - denoised_uncond)
+        # Classifier-free guidance (standard or CFG++)
+        if current_cfg_scale != 1.0:
+            denoised_uncond = edm_precond(model, x_hat.float(), mri_uncond, sigma_batch, sigma_data, mask=mask).double()
+            
+            if use_cfg_plus_plus:
+                denoised = apply_cfg_plus_plus(denoised_cond, denoised_uncond,
+                                                current_cfg_scale, cfg_rescale_factor)
+            else:
+                denoised = denoised_uncond + current_cfg_scale * (denoised_cond - denoised_uncond)
         else:
             denoised = denoised_cond
         
@@ -387,20 +909,26 @@ def edm_sample(
         update = (t_next - t_hat) * d_cur
         x_next = x_hat + update
         
+        # Heun's 2nd order correction
         if i < num_steps - 1 and t_next > 0:
             sigma_batch = torch.full((B,), t_next.item(), device=device, dtype=torch.float32)
-            denoised_cond_next = edm_precond(model, x_next.float(), mri, sigma_batch, sigma_data).double()
+            denoised_cond_next = edm_precond(model, x_next.float(), mri, sigma_batch, sigma_data, mask=mask).double()
             
-            if cfg_scale != 1.0:
-                denoised_uncond_next = edm_precond(model, x_next.float(), mri_uncond, sigma_batch, sigma_data).double()
-                denoised_next = denoised_uncond_next + cfg_scale * (denoised_cond_next - denoised_uncond_next)
+            if current_cfg_scale != 1.0:
+                denoised_uncond_next = edm_precond(model, x_next.float(), mri_uncond, sigma_batch, sigma_data, mask=mask).double()
+                
+                if use_cfg_plus_plus:
+                    denoised_next = apply_cfg_plus_plus(denoised_cond_next, denoised_uncond_next,
+                                                         current_cfg_scale, cfg_rescale_factor)
+                else:
+                    denoised_next = denoised_uncond_next + current_cfg_scale * (denoised_cond_next - denoised_uncond_next)
             else:
                 denoised_next = denoised_cond_next
             
             d_prime = (x_next - denoised_next) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
         
-        # Track statistics
+        # Track statistics at checkpoints (every ~20% of steps)
         checkpoint_interval = max(1, num_steps // 5)
         if i % checkpoint_interval == 0 or i == num_steps - 2:
             traj_norms.append(x_next.norm().item())
@@ -433,7 +961,10 @@ def edm_sample(
 
 def train(cfg: dict):
     """Main training function with Accelerate for 2.5D model."""
-    
+
+    # Enable cuDNN autotuner for stable input shapes (mirrors 2D trainer).
+    torch.backends.cudnn.benchmark = True
+
     # Create output directory
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(cfg["output_dir"]) / f"{timestamp}_pfgm_fir_25d"
@@ -466,13 +997,12 @@ def train(cfg: dict):
         print(f"Number of processes: {accelerator.num_processes}")
         print(f"Mixed precision: {cfg['mixed_precision']}")
         print(f"Num slices: {cfg['num_slices']}")
+        print(f"PFGM++: {cfg.get('pfgmpp', False)}")
         print(f"{'='*60}\n")
     
     # Build 2.5D model
-    # Handle window_size_3d: can be dict or tuple
     ws_3d = cfg["window_size_3d"]
     if isinstance(ws_3d, dict):
-        # Convert list values to tuples
         ws_3d = {k: tuple(v) if isinstance(v, list) else v for k, v in ws_3d.items()}
     else:
         ws_3d = tuple(ws_3d) if isinstance(ws_3d, list) else ws_3d
@@ -485,10 +1015,20 @@ def train(cfg: dict):
         channel_mults=tuple(cfg["channel_mults"]),
         attention_resolutions=tuple(cfg["attention_resolutions"]),
         num_res_blocks=cfg["num_res_blocks"],
+        num_heads=cfg.get("num_heads", 8),
+        mlp_ratio=cfg.get("mlp_ratio", 4.0),
         radius_emb_dim=cfg["radius_emb_dim"],
         window_size=cfg["window_size"],
         window_size_3d=ws_3d,
+        num_swin_blocks=cfg.get("num_swin_blocks", 2),
+        num_sfb_blocks=cfg.get("num_sfb_blocks", 1),
+        num_bottleneck_blocks=cfg.get("num_bottleneck_blocks", 2),
+        use_sfb=cfg.get("use_sfb", True),
         dropout=cfg["dropout"],
+        drop_path_rate=cfg.get("drop_path", 0.0),
+        gradient_checkpoint=cfg.get("gradient_checkpoint", False),
+        attention_type=cfg.get("attention_type", "window"),
+        deformable_kwargs=cfg.get("deformable_kwargs", None),
     )
     
     if accelerator.is_main_process:
@@ -500,6 +1040,8 @@ def train(cfg: dict):
         print(f"    attention_resolutions: {cfg['attention_resolutions']}")
         print(f"    num_res_blocks: {cfg['num_res_blocks']}")
         print(f"    num_slices: {cfg['num_slices']}")
+        print(f"    gradient_checkpoint: {cfg.get('gradient_checkpoint', False)}")
+        print(f"    mixed_precision: {cfg['mixed_precision']}")
     
     # Check if FSDP is enabled
     is_fsdp = accelerator.distributed_type == DistributedType.FSDP
@@ -518,14 +1060,21 @@ def train(cfg: dict):
             betas=(0.9, 0.95),
         )
     
+    # =========================================================================
     # Data loading
+    # =========================================================================
     if accelerator.is_main_process:
         print("Loading data files...")
+    
+    use_body_mask = cfg.get("use_body_mask", False)
+    mask_pattern = cfg.get("mask_pattern", "mask.nii")
     
     all_files = collect_data_files(
         cfg["data_dir"],
         mr_pattern=cfg["mr_pattern"],
-        ct_pattern=cfg["ct_pattern"]
+        ct_pattern=cfg["ct_pattern"],
+        mask_pattern=mask_pattern,
+        use_body_mask=use_body_mask,
     )
     
     random.shuffle(all_files)
@@ -535,15 +1084,18 @@ def train(cfg: dict):
     
     if accelerator.is_main_process:
         print(f"Found {len(train_files)} train, {len(val_files) if val_files else 0} val patients")
+        if use_body_mask:
+            print(f"Body mask training ENABLED - using mask pattern: {mask_pattern}")
         print("Creating 2.5D datasets...")
     
-    train_transforms = get_monai_nifti_transforms_25d(mode="train")
+    train_transforms = get_monai_nifti_transforms_25d(mode="train", use_body_mask=use_body_mask)
     train_dataset = MonaiNifti25DDataset(
         data=train_files,
         transform=train_transforms,
         target_size=cfg["image_size"],
         num_slices=cfg["num_slices"],
         stride=cfg.get("slice_stride"),
+        use_body_mask=use_body_mask,
     )
     
     if accelerator.is_main_process:
@@ -563,23 +1115,26 @@ def train(cfg: dict):
     
     val_loader = None
     if val_files:
-        val_transforms = get_monai_nifti_transforms_25d(mode="val")
+        val_transforms = get_monai_nifti_transforms_25d(mode="val", use_body_mask=use_body_mask)
         val_dataset = MonaiNifti25DDataset(
             data=val_files,
             transform=val_transforms,
             target_size=cfg["image_size"],
             num_slices=cfg["num_slices"],
             stride=cfg.get("slice_stride"),
+            use_body_mask=use_body_mask,
         )
         val_loader = DataLoader(
             val_dataset,
             batch_size=cfg["batch_size"],
-            shuffle=False,
+            shuffle=True,
             num_workers=cfg["num_workers"],
             pin_memory=True,
         )
     
+    # =========================================================================
     # Learning rate scheduler
+    # =========================================================================
     total_steps = len(train_loader) * cfg["num_epochs"]
     warmup_steps = cfg.get("warmup_steps", 500)
     
@@ -587,16 +1142,19 @@ def train(cfg: dict):
         if current_step < warmup_steps:
             return float(current_step) / float(max(1, warmup_steps))
         progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress)))
     
-    # For non-FSDP, create scheduler before prepare
     scheduler = None
     if not is_fsdp:
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
+    # =========================================================================
     # Prepare with Accelerator
+    # =========================================================================
     if accelerator.is_main_process:
         print("Preparing model and data with Accelerator...")
+    
+    accelerator.wait_for_everyone()
     
     if is_fsdp:
         model = accelerator.prepare(model)
@@ -608,17 +1166,30 @@ def train(cfg: dict):
         )
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         optimizer, train_loader, scheduler = accelerator.prepare(optimizer, train_loader, scheduler)
-        if val_loader:
-            val_loader = accelerator.prepare(val_loader)
     else:
         model, optimizer, train_loader, scheduler = accelerator.prepare(
             model, optimizer, train_loader, scheduler
         )
-        if val_loader:
-            val_loader = accelerator.prepare(val_loader)
+    
+    if val_loader is not None:
+        val_loader = accelerator.prepare(val_loader)
     
     if accelerator.is_main_process:
         print("Model and data prepared!")
+    
+    # =========================================================================
+    # Initialize EMA
+    # =========================================================================
+    ema = None
+    if cfg.get("use_ema", True):
+        unwrapped_model = accelerator.unwrap_model(model)
+        ema = EMA(
+            unwrapped_model,
+            decay=cfg.get("ema_decay", 0.9999),
+            device=accelerator.device,
+        )
+        if accelerator.is_main_process:
+            print(f"EMA enabled with decay={cfg.get('ema_decay', 0.9999)}")
     
     # Initialize tracking
     trackable_cfg = {}
@@ -636,7 +1207,9 @@ def train(cfg: dict):
         print(f"Total training steps: {total_steps}")
         print(f"Starting training...\n")
     
+    # =========================================================================
     # Metrics
+    # =========================================================================
     if TORCHMETRICS_AVAILABLE and accelerator.is_main_process:
         psnr_metric = torchmetrics.image.PeakSignalNoiseRatio(data_range=1.0).to(accelerator.device)
         ssim_metric = torchmetrics.image.StructuralSimilarityIndexMeasure(data_range=1.0).to(accelerator.device)
@@ -647,12 +1220,22 @@ def train(cfg: dict):
     global_step = 0
     best_val_loss = float('inf')
     
+    # =========================================================================
     # Training loop
+    # =========================================================================
     for epoch in range(cfg["num_epochs"]):
         epoch_start = time.time()
         model.train()
         epoch_loss = 0.0
         num_batches = 0
+        
+        # Linearly decay cond_drop_prob from initial value to 0.0
+        cond_drop_start = cfg.get("cond_drop_prob", 0.0)
+        cond_drop_end_epoch = cfg.get("cond_drop_prob_end_epoch", 40)
+        if cond_drop_end_epoch > 0 and cond_drop_start > 0:
+            cond_drop_prob = max(0.0, cond_drop_start * (1.0 - epoch / cond_drop_end_epoch))
+        else:
+            cond_drop_prob = cond_drop_start
         
         pbar = tqdm(
             train_loader,
@@ -663,6 +1246,7 @@ def train(cfg: dict):
         for batch_idx, batch in enumerate(pbar):
             mr = batch["mr"]  # [B, 1, D, H, W]
             ct = batch["ct"]  # [B, 1, D, H, W]
+            body_mask = batch.get("mask", None)
             
             batch_size = mr.shape[0]
             sigma = sample_sigma(
@@ -679,10 +1263,13 @@ def train(cfg: dict):
                     model, ct, mr, sigma,
                     sigma_data=cfg["sigma_data"],
                     loss_type=cfg["loss_type"],
-                    cond_drop_prob=cfg.get("cond_drop_prob", 0.0),
+                    cond_drop_prob=cond_drop_prob,
                     use_masked_loss=cfg.get("use_masked_loss", False),
                     masked_loss_ratio=cfg.get("masked_loss_ratio", 0.6),
                     mask_threshold=cfg.get("mask_threshold", -0.7),
+                    pfgmpp=cfg.get("pfgmpp", False),
+                    D=cfg.get("D", 128),
+                    body_mask=body_mask,
                 )
                 
                 accelerator.backward(loss)
@@ -693,6 +1280,10 @@ def train(cfg: dict):
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+                
+                # Update EMA weights
+                if ema is not None and global_step % cfg.get("ema_update_every", 1) == 0:
+                    ema.update()
             
             # Gather loss across processes
             gathered_loss = accelerator.gather(loss.detach()).mean()
@@ -701,7 +1292,8 @@ def train(cfg: dict):
             
             pbar.set_postfix({
                 "loss": f"{gathered_loss.item():.3e}",
-                "lr": f"{scheduler.get_last_lr()[0]:.2e}"
+                "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+                "cdp": f"{cond_drop_prob:.3f}",
             })
             
             if batch_idx % cfg["log_every"] == 0:
@@ -715,6 +1307,7 @@ def train(cfg: dict):
                     "train/sigma_max": metrics['sigma_max'],
                     "train/sigma_min": metrics['sigma_min'],
                     "train/masked": metrics['masked'],
+                    "train/cond_drop_prob": cond_drop_prob,
                 }
                 if 'mask_ratio' in metrics:
                     log_dict["train/mask_ratio"] = metrics['mask_ratio']
@@ -739,7 +1332,9 @@ def train(cfg: dict):
             
             global_step += 1
         
+        # =====================================================================
         # Epoch stats
+        # =====================================================================
         avg_loss = epoch_loss / num_batches
         epoch_time = time.time() - epoch_start
         
@@ -748,7 +1343,6 @@ def train(cfg: dict):
             "system/epoch_time": epoch_time,
         }, step=epoch)
         
-        # Log GPU memory if available
         if torch.cuda.is_available() and accelerator.is_main_process:
             gpu_mem_mb = torch.cuda.max_memory_allocated(accelerator.device) / 1024**2
             accelerator.log({"system/gpu_memory_MB": gpu_mem_mb}, step=epoch)
@@ -756,28 +1350,59 @@ def train(cfg: dict):
         if accelerator.is_main_process:
             print(f"\nEpoch {epoch+1}: avg_loss={avg_loss:.3e}, time={epoch_time:.1f}s")
         
-        # Sample generation (visualize center slice only)
+        # =====================================================================
+        # Sample generation (visualize center slice)
+        # =====================================================================
         if (epoch + 1) % cfg["sample_every"] == 0:
             model.eval()
             
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # All ranks must participate in DataLoader iteration to avoid NCCL timeout
             sample_batch = next(iter(train_loader))
             mr_samples = sample_batch["mr"][:cfg["num_val_samples"]]
             ct_samples = sample_batch["ct"][:cfg["num_val_samples"]]
+            sample_mask = sample_batch.get("mask", None)
+            if sample_mask is not None:
+                sample_mask = sample_mask[:cfg["num_val_samples"]]
             
             if accelerator.is_main_process:
                 with torch.no_grad():
                     unwrapped_model = accelerator.unwrap_model(model)
                     
+                    # Apply EMA weights for better generation quality
+                    if ema is not None:
+                        ema.apply_shadow()
+                    
+                    # Build sample kwargs
+                    sample_kwargs = dict(
+                        num_steps=cfg["num_sample_steps"],
+                        sigma_min=cfg["sigma_min"],
+                        sigma_max=cfg["sigma_max"],
+                        sigma_data=cfg["sigma_data"],
+                        rho=cfg["rho"],
+                        S_churn=cfg.get("S_churn", 0.0),
+                        S_min=cfg.get("S_min", 0.0),
+                        S_max=cfg.get("S_max", float('inf')),
+                        S_noise=cfg.get("S_noise", 1.0),
+                        cfg_scale=cfg.get("cfg_scale", 1.0),
+                        pfgmpp=cfg.get("pfgmpp", False),
+                        D=cfg.get("D", 128),
+                        use_cfg_plus_plus=cfg.get("use_cfg_plus_plus", False),
+                        cfg_rescale_factor=cfg.get("cfg_rescale_factor", 0.7),
+                        use_dynamic_cfg=cfg.get("use_dynamic_cfg", False),
+                        cfg_scale_min=cfg.get("cfg_scale_min", 1.0),
+                        cfg_scale_max=cfg.get("cfg_scale_max", 3.0),
+                        mask=sample_mask.to(accelerator.device) if sample_mask is not None else None,
+                    )
+                    
                     if cfg.get("log_ode_trajectory", False):
                         pred_ct, ode_stats = edm_sample(
                             unwrapped_model, mr_samples,
-                            num_steps=cfg["num_sample_steps"],
-                            sigma_min=cfg["sigma_min"],
-                            sigma_max=cfg["sigma_max"],
-                            sigma_data=cfg["sigma_data"],
-                            rho=cfg["rho"],
                             return_trajectory_stats=True,
-                            cfg_scale=cfg.get("cfg_scale", 1.0),
+                            **sample_kwargs,
                         )
                         accelerator.log({
                             "ode/initial_norm": ode_stats['initial_norm'],
@@ -789,12 +1414,7 @@ def train(cfg: dict):
                     else:
                         pred_ct = edm_sample(
                             unwrapped_model, mr_samples,
-                            num_steps=cfg["num_sample_steps"],
-                            sigma_min=cfg["sigma_min"],
-                            sigma_max=cfg["sigma_max"],
-                            sigma_data=cfg["sigma_data"],
-                            rho=cfg["rho"],
-                            cfg_scale=cfg.get("cfg_scale", 1.0),
+                            **sample_kwargs,
                         )
                     
                     # Extract center slice for visualization [B, 1, D, H, W] → [B, 1, H, W]
@@ -807,21 +1427,31 @@ def train(cfg: dict):
                     pred_ct_01 = (pred_ct_center + 1.0) / 2.0
                     ct_samples_01 = (ct_samples_center + 1.0) / 2.0
                     
+                    # Prepare mask for metrics (extract center slice)
+                    mask_for_metrics = None
+                    if sample_mask is not None and cfg.get("use_body_mask", False):
+                        mask_for_metrics = sample_mask[:, :, center_idx, :, :].to(pred_ct.device)
+                    
                     if psnr_metric is not None:
-                        psnr_val = psnr_metric(pred_ct_01, ct_samples_01)
-                        ssim_val = ssim_metric(pred_ct_01, ct_samples_01)
-                        mae_val = mae_metric(pred_ct_01, ct_samples_01) if mae_metric else None
+                        gen_metrics = compute_masked_metrics(
+                            pred_ct_01, ct_samples_01,
+                            mask=mask_for_metrics,
+                            psnr_metric=psnr_metric,
+                            ssim_metric=ssim_metric,
+                            mae_metric=mae_metric,
+                        )
                         
                         log_dict = {
-                            "gen/psnr": psnr_val.item(),
-                            "gen/ssim": ssim_val.item(),
+                            "gen/psnr": gen_metrics.get('psnr', 0.0),
+                            "gen/ssim": gen_metrics.get('ssim', 0.0),
                         }
-                        if mae_val is not None:
-                            log_dict["gen/mae"] = mae_val.item()
+                        if 'mae' in gen_metrics:
+                            log_dict["gen/mae"] = gen_metrics['mae']
                         
                         accelerator.log(log_dict, step=epoch)
-                        mae_str = f", MAE={mae_val:.5f}" if mae_val else ""
-                        print(f"  Generation (center slice): PSNR={psnr_val:.3f}, SSIM={ssim_val:.5f}{mae_str}")
+                        mae_str = f", MAE={gen_metrics['mae']:.5f}" if 'mae' in gen_metrics else ""
+                        mask_str = " (masked)" if mask_for_metrics is not None else ""
+                        print(f"  Generation{mask_str} (center slice): PSNR={gen_metrics.get('psnr', 0.0):.3f}, SSIM={gen_metrics.get('ssim', 0.0):.5f}{mae_str}")
                     
                     # Log training sample images to TensorBoard
                     img_grid = vutils.make_grid(
@@ -833,10 +1463,24 @@ def train(cfg: dict):
                     tb_tracker = accelerator.get_tracker("tensorboard")
                     if tb_tracker is not None:
                         tb_tracker.writer.add_image("Gen/MRI_Pred_GT_CenterSlice", img_grid, epoch)
+                    
+                    # Restore original weights after EMA sampling
+                    if ema is not None:
+                        ema.restore()
+            
+            # Free sampling memory before resuming training
+            del sample_batch, mr_samples, ct_samples
+            if sample_mask is not None:
+                del sample_mask
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             model.train()
         
+        # =====================================================================
         # Validation
+        # =====================================================================
         if val_loader is not None and (epoch + 1) % cfg["val_every"] == 0:
             model.eval()
             val_loss_accum = 0.0
@@ -846,6 +1490,7 @@ def train(cfg: dict):
                 for batch in val_loader:
                     mr = batch["mr"]
                     ct = batch["ct"]
+                    val_body_mask = batch.get("mask", None)
                     
                     sigma = sample_sigma(
                         batch_size=ct.shape[0],
@@ -859,7 +1504,10 @@ def train(cfg: dict):
                     loss, _ = edm_loss(
                         model, ct, mr, sigma,
                         sigma_data=cfg["sigma_data"],
-                        loss_type=cfg["loss_type"]
+                        loss_type=cfg["loss_type"],
+                        pfgmpp=cfg.get("pfgmpp", False),
+                        D=cfg.get("D", 128),
+                        body_mask=val_body_mask,
                     )
                     
                     gathered_loss = accelerator.gather(loss.detach()).mean()
@@ -878,9 +1526,123 @@ def train(cfg: dict):
                 if accelerator.is_main_process:
                     print(f"  New best model saved!")
             
+            # Free validation loss memory before generation
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Validation sample generation
+            val_sample_batch = next(iter(val_loader))
+            mr_val_samples = val_sample_batch["mr"][:cfg["num_val_samples"]]
+            ct_val_samples = val_sample_batch["ct"][:cfg["num_val_samples"]]
+            val_sample_mask = val_sample_batch.get("mask", None)
+            if val_sample_mask is not None:
+                val_sample_mask = val_sample_mask[:cfg["num_val_samples"]]
+            
+            if accelerator.is_main_process and psnr_metric is not None:
+                unwrapped_model = accelerator.unwrap_model(model)
+                
+                # Apply EMA weights
+                if ema is not None:
+                    ema.apply_shadow()
+                
+                val_sample_kwargs = dict(
+                    num_steps=cfg["num_sample_steps"],
+                    sigma_min=cfg["sigma_min"],
+                    sigma_max=cfg["sigma_max"],
+                    sigma_data=cfg["sigma_data"],
+                    rho=cfg["rho"],
+                    S_churn=cfg.get("S_churn", 0.0),
+                    S_min=cfg.get("S_min", 0.0),
+                    S_max=cfg.get("S_max", float('inf')),
+                    S_noise=cfg.get("S_noise", 1.0),
+                    cfg_scale=cfg.get("cfg_scale", 1.0),
+                    pfgmpp=cfg.get("pfgmpp", False),
+                    D=cfg.get("D", 128),
+                    use_cfg_plus_plus=cfg.get("use_cfg_plus_plus", False),
+                    cfg_rescale_factor=cfg.get("cfg_rescale_factor", 0.7),
+                    use_dynamic_cfg=cfg.get("use_dynamic_cfg", False),
+                    cfg_scale_min=cfg.get("cfg_scale_min", 1.0),
+                    cfg_scale_max=cfg.get("cfg_scale_max", 3.0),
+                    mask=val_sample_mask.to(accelerator.device) if val_sample_mask is not None else None,
+                )
+                
+                if cfg.get("use_tta", False):
+                    pred_val_ct = edm_sample_tta(
+                        unwrapped_model, mr_val_samples,
+                        tta_flips=cfg.get("tta_flips", ["lr", "ud", "lr_ud"]),
+                        **val_sample_kwargs,
+                    )
+                else:
+                    pred_val_ct = edm_sample(
+                        unwrapped_model, mr_val_samples,
+                        **val_sample_kwargs,
+                    )
+                
+                # Extract center slice for metrics and visualization
+                center_idx = cfg["num_slices"] // 2
+                pred_val_center = pred_val_ct[:, :, center_idx, :, :]
+                ct_val_center = ct_val_samples[:, :, center_idx, :, :]
+                mr_val_center = mr_val_samples[:, :, center_idx, :, :]
+                
+                pred_val_center = torch.clamp(pred_val_center, -1.0, 1.0)
+                pred_val_ct_01 = (pred_val_center + 1.0) / 2.0
+                ct_val_samples_01 = (ct_val_center + 1.0) / 2.0
+                
+                # Prepare mask for validation metrics (center slice)
+                val_mask_for_metrics = None
+                if val_sample_mask is not None and cfg.get("use_body_mask", False):
+                    val_mask_for_metrics = val_sample_mask[:, :, center_idx, :, :].to(pred_val_ct.device)
+                
+                val_gen_metrics = compute_masked_metrics(
+                    pred_val_ct_01, ct_val_samples_01,
+                    mask=val_mask_for_metrics,
+                    psnr_metric=psnr_metric,
+                    ssim_metric=ssim_metric,
+                    mae_metric=mae_metric,
+                )
+                
+                val_gen_log = {
+                    "val_gen/psnr": val_gen_metrics.get('psnr', 0.0),
+                    "val_gen/ssim": val_gen_metrics.get('ssim', 0.0),
+                }
+                if 'mae' in val_gen_metrics:
+                    val_gen_log["val_gen/mae"] = val_gen_metrics['mae']
+                
+                accelerator.log(val_gen_log, step=epoch)
+                
+                val_mae_str = f", MAE={val_gen_metrics['mae']:.5f}" if 'mae' in val_gen_metrics else ""
+                val_mask_str = " (masked)" if val_mask_for_metrics is not None else ""
+                print(f"  Val Generation{val_mask_str} (center slice): PSNR={val_gen_metrics.get('psnr', 0.0):.3f}, SSIM={val_gen_metrics.get('ssim', 0.0):.5f}{val_mae_str}")
+                
+                # Log validation sample images to TensorBoard
+                val_img_grid = vutils.make_grid(
+                    torch.cat([mr_val_center.cpu(), pred_val_center.cpu(), ct_val_center.cpu()], dim=0),
+                    nrow=cfg["num_val_samples"],
+                    normalize=True,
+                    scale_each=True
+                )
+                tb_tracker = accelerator.get_tracker("tensorboard")
+                if tb_tracker is not None:
+                    tb_tracker.writer.add_image("Val_Gen/MRI_Pred_GT_CenterSlice", val_img_grid, epoch)
+                
+                # Restore original weights
+                if ema is not None:
+                    ema.restore()
+            
+            # Free validation generation memory
+            del val_sample_batch, mr_val_samples, ct_val_samples
+            if val_sample_mask is not None:
+                del val_sample_mask
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
             model.train()
         
+        # =====================================================================
         # Save checkpoint
+        # =====================================================================
         if (epoch + 1) % cfg["save_every"] == 0:
             accelerator.save_state(output_dir / "checkpoints" / f"epoch_{epoch+1:04d}")
             if accelerator.is_main_process:

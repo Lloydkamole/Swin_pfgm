@@ -14,9 +14,14 @@ This module contains the neural network components for PFGM-FIR:
 from .embeddings import RadiusEmbedding, FourierEmbedding, TimestepEmbedding, timestep_embedding
 from .swin_attention import (
     SwinTransformerBlock,
+    AdaLNZeroSwinTransformerBlock,
     WindowAttention,
     window_partition,
     window_reverse,
+)
+from .deformable_attention import (
+    DeformableAttention,
+    AdaLNZeroDeformableBlock,
 )
 from .fir_blocks import (
     FourierUnit,
@@ -29,6 +34,7 @@ from .fir_blocks import (
     Downsample,
     Upsample,
     LayerNorm2d,
+    AdaGroupNorm,
 )
 from .network import SwinFIRUNet, SwinFIRUNetConfig, create_swin_fir_unet
 
@@ -61,9 +67,13 @@ __all__ = [
     'timestep_embedding',
     # Swin attention
     'SwinTransformerBlock',
+    'AdaLNZeroSwinTransformerBlock',
     'WindowAttention',
     'window_partition',
     'window_reverse',
+    # Deformable attention
+    'DeformableAttention',
+    'AdaLNZeroDeformableBlock',
     # FIR blocks
     'FourierUnit',
     'SpectralTransform',
@@ -74,6 +84,7 @@ __all__ = [
     'FIRResBlock',
     'Downsample',
     'Upsample',
+    'AdaGroupNorm',
     # Main network
     'SwinFIRUNet',
     'SwinFIRUNetConfig',

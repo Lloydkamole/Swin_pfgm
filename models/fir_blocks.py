@@ -18,7 +18,8 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from typing import Optional, Tuple
 
-from .swin_attention import SwinTransformerBlock
+from .swin_attention import SwinTransformerBlock, AdaLNZeroSwinTransformerBlock
+from .deformable_attention import AdaLNZeroDeformableBlock
 
 
 class LayerNorm2d(nn.Module):
@@ -67,6 +68,54 @@ class LayerNorm2d(nn.Module):
             x = x * self.weight.view(1, -1, 1, 1) + self.bias.view(1, -1, 1, 1)
         
         return x
+
+
+def get_num_groups(channels: int, target: int = 32) -> int:
+    """Get a valid number of groups for GroupNorm, targeting `target` groups."""
+    while channels % target != 0 and target > 1:
+        target -= 1
+    return target
+
+
+class AdaGroupNorm(nn.Module):
+    """
+    Adaptive Group Normalization (AdaGN) for conditioning conv blocks.
+    
+    Replaces the LayerNorm2d + FiLM pattern with a single module that:
+    1. Applies GroupNorm (without learnable affine)
+    2. Predicts per-channel scale and shift from the conditioning embedding
+    3. Applies the adaptive affine transform
+    
+    This is the standard conditioning mechanism in ADM (Dhariwal & Nichol, 2021)
+    and subsequent diffusion models. It folds FiLM into the normalization layer.
+    
+    Args:
+        num_channels: Number of feature channels
+        r_emb_dim: Dimension of the conditioning embedding
+        num_groups: Number of groups for GroupNorm (default 32)
+    """
+    
+    def __init__(self, num_channels: int, r_emb_dim: int, num_groups: int = 32):
+        super().__init__()
+        num_groups = get_num_groups(num_channels, num_groups)
+        self.gn = nn.GroupNorm(num_groups, num_channels, affine=False)
+        self.proj = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(r_emb_dim, num_channels * 2),
+        )
+    
+    def forward(self, x: torch.Tensor, r_emb: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Feature tensor [B, C, H, W]
+            r_emb: Conditioning embedding [B, r_emb_dim]
+        
+        Returns:
+            Adaptively normalized tensor [B, C, H, W]
+        """
+        x = self.gn(x)
+        scale, shift = self.proj(r_emb).chunk(2, dim=-1)
+        return x * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
 
 
 class FourierUnit(nn.Module):
@@ -329,6 +378,10 @@ class FIRResBlock(nn.Module):
         num_sfb_blocks: Number of SFB blocks applied after Swin.
         gradient_checkpoint: Enable gradient checkpointing for Swin/SFB blocks
             to trade ~30% speed for ~60% activation memory savings.
+        attention_type: Type of attention mechanism ('window' or 'deformable').
+        deformable_kwargs: Extra kwargs for DeformableAttention (n_groups,
+            offset_range_factor, kv_stride, etc.). Only used when
+            attention_type='deformable'.
     """
     
     def __init__(
@@ -347,6 +400,8 @@ class FIRResBlock(nn.Module):
         num_swin_blocks: int = 2,
         num_sfb_blocks: int = 1,
         gradient_checkpoint: bool = False,
+        attention_type: str = 'window',
+        deformable_kwargs: Optional[dict] = None,
     ):
         super().__init__()
         
@@ -357,32 +412,42 @@ class FIRResBlock(nn.Module):
         self.num_swin_blocks = num_swin_blocks
         self.num_sfb_blocks = num_sfb_blocks
         self.use_gradient_checkpoint = gradient_checkpoint
+        self.attention_type = attention_type
         
         # === Stage 1: Conv + FiLM (radius conditioning BEFORE attention) ===
-        # Use LayerNorm2d for consistent normalization statistics
-        self.norm1 = LayerNorm2d(in_channels)
+        # === Stage 1: AdaGN + Conv (radius conditioning via adaptive normalization) ===
+        self.adagn = AdaGroupNorm(in_channels, radius_emb_dim)
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         
-        # Radius conditioning via FiLM (scale and shift)
-        self.radius_proj = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(radius_emb_dim, out_channels * 2),
-        )
-        
-        # === Stage 2: Swin Transformer Attention (sequential) ===
+        # === Stage 2: Attention blocks (sequential) ===
         if use_swin and num_swin_blocks > 0:
-            self.swin_blocks = nn.ModuleList([
-                SwinTransformerBlock(
-                    dim=out_channels,
-                    input_resolution=input_resolution,
-                    num_heads=num_heads,
-                    window_size=window_size,
-                    shift_size=0 if i % 2 == 0 else window_size // 2,  # W-MSA / SW-MSA alternating
-                    mlp_ratio=mlp_ratio,
-                    drop_path=drop_path,
-                )
-                for i in range(num_swin_blocks)
-            ])
+            if attention_type == 'deformable':
+                _dkw = deformable_kwargs or {}
+                self.swin_blocks = nn.ModuleList([
+                    AdaLNZeroDeformableBlock(
+                        dim=out_channels,
+                        num_heads=num_heads,
+                        r_emb_dim=radius_emb_dim,
+                        mlp_ratio=mlp_ratio,
+                        drop_path=drop_path,
+                        **_dkw,
+                    )
+                    for _ in range(num_swin_blocks)
+                ])
+            else:
+                self.swin_blocks = nn.ModuleList([
+                    AdaLNZeroSwinTransformerBlock(
+                        dim=out_channels,
+                        input_resolution=input_resolution,
+                        num_heads=num_heads,
+                        r_emb_dim=radius_emb_dim,
+                        window_size=window_size,
+                        shift_size=0 if i % 2 == 0 else window_size // 2,  # W-MSA / SW-MSA alternating
+                        mlp_ratio=mlp_ratio,
+                        drop_path=drop_path,
+                    )
+                    for i in range(num_swin_blocks)
+                ])
         else:
             self.swin_blocks = None
         
@@ -414,6 +479,7 @@ class FIRResBlock(nn.Module):
         x: torch.Tensor,
         r_emb: torch.Tensor,
         x_size: Optional[Tuple[int, int]] = None,
+        spatial_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass with sequential Swin → SFB flow.
@@ -422,6 +488,9 @@ class FIRResBlock(nn.Module):
             x: Input tensor of shape [B, C, H, W]
             r_emb: Radius embedding of shape [B, radius_emb_dim]
             x_size: Optional (H, W) for Swin attention (uses actual size if None)
+            spatial_mask: Optional binary body mask [B, 1, H_orig, W_orig].
+                Downsampled to current feature resolution and passed to
+                deformable attention blocks to suppress background K/V.
         
         Returns:
             Output tensor of shape [B, out_channels, H, W]
@@ -431,33 +500,44 @@ class FIRResBlock(nn.Module):
         # === Skip connection (identity or channel projection) ===
         identity = self.skip(x)
         
-        # === Stage 1: Conv + FiLM (radius conditioning BEFORE attention) ===
-        h = self.norm1(x)
+        # === Stage 1: AdaGN + Conv (conditioning folded into normalization) ===
+        h = self.adagn(x, r_emb)
         h = F.silu(h)
         h = self.conv1(h)
         
-        # FiLM modulation: inject noise level information
-        r_cond = self.radius_proj(r_emb)
-        scale, shift = r_cond.chunk(2, dim=-1)
-        scale = scale[:, :, None, None]  # [B, C, 1, 1]
-        shift = shift[:, :, None, None]
-        h = h * (1 + scale) + shift
-        
-        # === Stage 2: Swin Attention (sequential, with gradient checkpointing) ===
+        # === Stage 2: Swin Attention with AdaLN-Zero (sequential, with gradient checkpointing) ===
         if self.swin_blocks is not None:
             # Reshape for Swin: [B, C, H, W] -> [B, H*W, C]
             h_flat = h.flatten(2).transpose(1, 2)
             current_size = x_size if x_size is not None else (H, W)
-            
+
+            # Downsample spatial mask to current feature resolution for attention masking
+            mask_at_res = None
+            if spatial_mask is not None and self.attention_type == 'deformable':
+                mask_at_res = F.interpolate(
+                    spatial_mask.float(), size=(H, W), mode='nearest'
+                )  # [B, 1, H, W]
+
             for swin_block in self.swin_blocks:
                 if self.training and self.use_gradient_checkpoint:
-                    h_flat = grad_checkpoint(
-                        swin_block, h_flat, current_size,
-                        use_reentrant=False,
-                    )
+                    if mask_at_res is not None:
+                        h_flat = grad_checkpoint(
+                            swin_block, h_flat, current_size, r_emb, mask_at_res,
+                            use_reentrant=False,
+                        )
+                    else:
+                        h_flat = grad_checkpoint(
+                            swin_block, h_flat, current_size, r_emb,
+                            use_reentrant=False,
+                        )
                 else:
-                    h_flat = swin_block(h_flat, current_size)
-            
+                    if mask_at_res is not None:
+                        h_flat = swin_block(
+                            h_flat, current_size, r_emb, spatial_mask=mask_at_res
+                        )
+                    else:
+                        h_flat = swin_block(h_flat, current_size, r_emb)
+
             # Reshape back: [B, H*W, C] -> [B, C, H, W]
             h = h_flat.transpose(1, 2).view(B, -1, H, W)
         
