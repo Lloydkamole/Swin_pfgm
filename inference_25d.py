@@ -10,7 +10,7 @@ from safetensors.torch import load_file
 
 from examples.synthetic_demo import save_comparison
 from loader_25d import MonaiNifti25DDataset, get_monai_nifti_transforms_25d
-from train_accelerate_25d import build_model, compute_masked_metrics, edm_sample, load_config
+from train_accelerate_25d import build_model, compute_masked_metrics, edm_sample, load_config, mask_generated_ct
 
 
 def main():
@@ -33,12 +33,13 @@ def main():
     torch.set_num_threads(2)
     torch.manual_seed(args.seed)
     cfg = load_config(args.config)
+    use_body_mask = cfg["use_body_mask"] or args.mask is not None
     entry = {"mr": str(args.mr), "ct": str(args.ct or args.mr)}
     if args.mask:
         entry["mask"] = str(args.mask)
-    dataset = MonaiNifti25DDataset([entry], get_monai_nifti_transforms_25d("val", cfg["use_body_mask"]),
+    dataset = MonaiNifti25DDataset([entry], get_monai_nifti_transforms_25d("val", use_body_mask),
                                   target_size=cfg["image_size"], num_slices=cfg["num_slices"],
-                                  stride=cfg["slice_stride"], use_body_mask=cfg["use_body_mask"], mode="val")
+                                  stride=cfg["slice_stride"], use_body_mask=use_body_mask, mode="val")
     if args.patch_index >= len(dataset):
         parser.error(f"patch-index must be less than {len(dataset)}")
     patch = dataset[args.patch_index]
@@ -50,12 +51,16 @@ def main():
     kwargs = {key: cfg[key] for key in ["sigma_min", "sigma_max", "sigma_data", "rho", "S_churn",
               "S_min", "S_max", "S_noise", "cfg_scale", "pfgmpp", "D", "use_cfg_plus_plus",
               "cfg_rescale_factor", "use_dynamic_cfg", "cfg_scale_min", "cfg_scale_max"]}
-    prediction = edm_sample(model, mr, num_steps=args.steps or cfg["num_sample_steps"], mask=mask, **kwargs)
+    # A supplied mask can black out output even if mask conditioning was disabled in training.
+    sampling_mask = mask if cfg["use_body_mask"] else None
+    prediction = edm_sample(model, mr, num_steps=args.steps or cfg["num_sample_steps"], mask=sampling_mask, **kwargs)
+    prediction = mask_generated_ct(prediction, mask)
     if not torch.isfinite(prediction).all():
         raise RuntimeError("Sampler produced nonfinite values")
     center = cfg["num_slices"] // 2
     panels = [("MRI input", mr[0, 0, center]), ("Predicted CT", prediction[0, 0, center])]
     report = {"seed": args.seed, "patch_index": args.patch_index, "shape": list(prediction.shape),
+              "background": "-1 outside the supplied body mask; 0 after mapping to [0, 1]",
               "weight_type": "raw checkpoint weights; EMA weights not restored", "metrics": {}}
     if args.ct:
         ct = patch["ct"].unsqueeze(0).to(args.device)

@@ -56,3 +56,11 @@ The available environment's torchvision image extension emitted a missing CUDA-l
 A fresh dependency installation, Python 3.10/3.11 execution, full-model GPU training/inference, bf16 GPU numerical behavior, multi-GPU DDP, FSDP, distributed EMA, long training, and evaluation on the full real-data cohort were not run. NVIDIA-SMI could not communicate with the driver and PyTorch reported no CUDA devices. CPU smoke checks do not establish those paths' correctness or performance.
 
 No dataset was downloaded, no full real-data training was started, and no assets were uploaded or pushed. Historical metrics remain sample-level logged observations with the limitations in [results.md](results.md).
+
+## Generated-background update
+
+`python -m tools.check_25d` passed four tests after the update. The additional checks verify that masked-out output voxels become -1 (exactly 0 in [0,1]), foreground values remain unchanged, the no-mask output is preserved, trajectory statistics remain unchanged for a mask-independent model, and flip-augmented outputs retain black backgrounds. The synthetic example was rerun successfully and explicitly checks its masked background. Its original single-update loss remains 0.44548917.
+
+Patch inference was rerun with the synthetic checkpoint, both with mask conditioning enabled and with conditioning disabled but an explicit output mask supplied. Saved prediction tensors were checked: every masked-out voxel maps to exactly 0 in [0,1].
+
+The three historical showcase cases were matched against source MRI and reference CT center slices with zero mean absolute uint8 pixel error for all six comparisons. Their actual source masks were applied to generated tiles only; foreground pixels and the recorded historical scores were preserved. The preview was replotted with this postprocessing disclosed in its caption and provenance.

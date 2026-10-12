@@ -811,6 +811,16 @@ def edm_sample_tta(
 # Sampling
 # =============================================================================
 
+def mask_generated_ct(prediction: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+    """Set generated background to -1, which maps to black/0 in the [0, 1] display.
+
+    Apply only to the final output; preserve foreground values and the sampling trajectory.
+    """
+    if mask is None:
+        return prediction
+    return torch.where(mask.to(device=prediction.device) > 0, prediction, -1.0)
+
+
 @torch.no_grad()
 def edm_sample(
     model: nn.Module,
@@ -949,7 +959,7 @@ def edm_sample(
             score_norms.append(d_cur.norm().item())
             update_norms.append(update.norm().item())
     
-    result = x_next.float()
+    result = mask_generated_ct(x_next.float(), mask)
     
     if return_trajectory_stats:
         stats = {

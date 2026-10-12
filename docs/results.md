@@ -8,7 +8,7 @@ The selected showcase is `20260627_104352_pfgm_fir_25d`, logged step 165 (**epoc
 
 ![Selected logged validation comparison](assets/synthrad_validation.png)
 
-The preview uses the original TensorBoard tile scaling (`normalize=True, scale_each=True`), with labels and attribution added. It does not use a shared HU/intensity window. Rows: MRI / prediction / reference; columns: three sampled validation center slices. The author identifies the source as SynthRAD2023/SynthRAD2025 and authorized inclusion. Exact case IDs were not logged. See [asset provenance](showcase_provenance.json) and [dataset attribution](../ATTRIBUTION.md).
+The preview retains original TensorBoard foreground tile scaling (`normalize=True, scale_each=True`), with labels and attribution added. Generated CT pixels outside the actual body masks are set to black. Source masks were recovered by exact uint8 MRI and reference-CT matching against RAS-oriented, resized source center slices: all three MRI and CT matches have zero mean absolute pixel error. Foreground pixels are unchanged. It does not use a shared HU/intensity window. Rows: MRI / prediction / reference; columns: three sampled validation center slices, now identified as SynthRAD2023 cases without including patient identifiers. The author authorized inclusion. Historical logged scores are retained; masking this figure does not represent a new model evaluation. See [asset provenance](showcase_provenance.json) and [dataset attribution](../ATTRIBUTION.md).
 
 ## Comparison at each run's best PSNR event
 

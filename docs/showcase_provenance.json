@@ -5,12 +5,34 @@
   "epoch": 166,
   "metrics_scope": "Three sampled validation center slices at the same event step",
   "original_image_sha256": "42c0256d778e71468d1124e87f4305477d52d613e7b979008ba136816d472399",
-  "display": "Original TensorBoard independently normalized tiles; labels and attribution added; intensity normalization not reversed",
-  "dataset": "SynthRAD2023 and SynthRAD2025, as reported by the project author; specific case IDs and edition membership of these tiles not logged",
+  "display": "Replotted original TensorBoard tiles; predicted background set to 0 using actual matched body masks; all foreground pixels unchanged; historical independent per-image scaling retained",
+  "dataset": "SynthRAD2023 Task-1 brain cases, identified by exact MRI and CT image matches against the current prepared dataset; no patient identifiers included",
   "permission": "Project author explicitly authorized including sample images; dataset-specific license and attribution retained",
   "dataset_terms": [
     "https://synthrad2023.grand-challenge.org/Rules/",
     "https://synthrad2025.grand-challenge.org/data/"
   ],
-  "checkpoint_note": "No epoch_0166 snapshot; metric images use EMA; historical EMA state was not saved"
+  "checkpoint_note": "No epoch_0166 snapshot; metric images use EMA; historical EMA state was not saved",
+  "mask_recovery": {
+    "method": "Reconstruct RAS-oriented and resized source center slices; match their per-image-normalized uint8 MRI and reference CT pixels against the original TensorBoard tiles",
+    "mean_absolute_mri_pixel_errors": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "mean_absolute_ct_pixel_errors": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "body_masks": "Source binary masks, oriented and nearest-neighbor resized with the existing loader",
+    "mask_sha256": [
+      "4dd8fedfc5cf034b979ad56c560708ba6a993f79c0afde3fbe3c72c23600ee80",
+      "d84a422d69da664450eebe109bb433565a1707c05a5cf982610375d6e2b5f3b5",
+      "165deeb132db0a231ee7ebbbfcc09c75f4f67ba7d3a99dc04c4a5454e79a21d7"
+    ],
+    "foreground_pixels_unchanged": true,
+    "predicted_background_pixel_value": 0,
+    "metrics": "Historical logged metrics retained; no new model result or score claimed"
+  }
 }

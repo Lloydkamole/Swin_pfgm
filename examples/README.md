@@ -8,7 +8,7 @@ python -m examples.synthetic_demo
 
 The script creates four normalized, aligned analytic phantoms, loads 4 × 32 × 32 patches through the actual NIfTI loader, computes the PFGM++ training loss, checks finite gradients, takes one optimizer step, and samples with a tiny 3D spatial-frequency/deformable-attention model on CPU. Inspect `examples/generated/report.json` and `examples/generated/comparison.png`.
 
-The comparison labels the input, synthetic CT reference, and **untrained pipeline output**. All panels use a fixed `[-1, 1]` window. This proves the code path executes; one optimization step does not produce meaningful trained CT synthesis. The demonstration uses two sampler steps and sigma_max 1 for an inexpensive check, rather than the full training sampler's settings.
+The comparison labels the input, synthetic CT reference, and **untrained pipeline output**. All panels use a fixed `[-1, 1]` window; the generated CT background is -1 outside its body mask and therefore displays as black. This proves the code path executes; one optimization step does not produce meaningful trained CT synthesis. The demonstration uses two sampler steps and sigma_max 1 for an inexpensive check, rather than the full training sampler's settings.
 
 To exercise the complete trainer, including patient splitting, EMA, validation, TensorBoard and best/final checkpoint saves:
 

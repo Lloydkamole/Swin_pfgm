@@ -94,6 +94,7 @@ def main():
     prediction = edm_sample(model, mr, num_steps=2, sigma_min=0.002, sigma_max=1.0,
                             sigma_data=cfg["sigma_data"], pfgmpp=True, D=cfg["D"], mask=mask)
     assert prediction.shape == ct.shape and torch.isfinite(prediction).all()
+    assert torch.equal(prediction[mask == 0], torch.full_like(prediction[mask == 0], -1))
     panels = [("Synthetic MRI input", mr[0, 0, 2]), ("Synthetic CT reference", ct[0, 0, 2]),
               ("Pipeline output (untrained)", prediction[0, 0, 2])]
     save_comparison(args.output_dir / "comparison.png", panels,
@@ -105,7 +106,8 @@ def main():
     save_config(cfg, args.output_dir / "config.json")
     report = {"purpose": "Pipeline check, not trained synthesis results", "seed": 42,
               "shape": list(prediction.shape), "loss": float(loss.detach()),
-              "finite_gradients": True, "finite_prediction": True, "optimization_steps": 1,
+              "finite_gradients": True, "finite_prediction": True, "masked_background_is_black": True,
+              "optimization_steps": 1,
               "sampling_steps": 2, "sampling_sigma_max": 1.0}
     (args.output_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))

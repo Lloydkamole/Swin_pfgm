@@ -29,7 +29,7 @@ The preceding README declared MIT but no project license text was found in reach
 
 ## Scientific behavior and reproducibility
 
-The model layers, loss, perturbation/prior functions, metric formulas, sampler, guidance calculations and data transforms are retained. Configuration/launch changes remove the embedded workstation data path, allow JSON overrides, reject unknown keys, fail explicitly on unsupported resume, and save new runs' resolved configurations and patient split manifests. New inference wraps the existing model, loader, sampler and metric helpers.
+The model layers, loss, perturbation/prior functions, metric formulas, sampler dynamics, guidance calculations and data transforms are retained. At the author's request, final generated outputs now set masked-out voxels to -1 (0 after mapping to [0,1]); this does not change foreground predictions or training calculations. Configuration/launch changes remove the embedded workstation data path, allow JSON overrides, reject unknown keys, fail explicitly on unsupported resume, and save new runs' resolved configurations and patient split manifests. New inference wraps the existing model, loader, sampler and metric helpers.
 
 Remaining gaps are documented rather than replaced with assumptions: historical preprocessing/CT inverse scaling, dataset membership and source revision; sampled rather than full-dataset generation metrics; absent historical EMA checkpoint state; no exact checkpoint for the highest-PSNR event; unverified FSDP and full-model GPU execution; patch-only inference; loader error fallbacks and pre-orientation slice indexing; and gradient monitoring occurring after gradients have been zeroed in the existing training loop.
 

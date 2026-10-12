@@ -6,7 +6,7 @@ Implementation by [Lloydkamole](https://github.com/Lloydkamole). The implementat
 
 ![MRI input, predicted CT, and reference CT for three sampled validation center slices](docs/assets/synthrad_validation.png)
 
-*Logged validation comparison from epoch 166 of `20260627_104352_pfgm_fir_25d`, selected by the highest recorded validation-sample PSNR. Rows: MRI, predicted CT, reference CT. Images were independently normalized by TensorBoard, so this preview does not use a shared HU window. Data source: SynthRAD2023 / SynthRAD2025, as reported by the author; individual case IDs were not logged. Dataset attribution and noncommercial terms apply. See [results and provenance](docs/results.md).*
+*Logged validation comparison from epoch 166 of `20260627_104352_pfgm_fir_25d`, selected by the highest recorded validation-sample PSNR. Rows: MRI, predicted CT, reference CT. Synthesized CT backgrounds are blacked out using the actual body masks, recovered by exact MRI/reference-CT pixel matching. Foreground pixels retain TensorBoard's original independent scaling, so this preview does not use a shared HU window. The three matched cases are from SynthRAD2023; patient identifiers are not included. Dataset attribution and noncommercial terms apply. See [results and provenance](docs/results.md).*
 
 ## What the code implements
 
@@ -45,7 +45,7 @@ python -m pip install torch==2.8.0 torchvision==0.23.0 \
 python -m pip install -r requirements.txt
 ```
 
-For an NVIDIA GPU environment, replace the CPU installation command with a build compatible with your driver, for example:
+For a CUDA-enabled GPU environment, replace the CPU installation command with a build compatible with your driver, for example:
 
 ```bash
 python -m pip install torch==2.8.0 torchvision==0.23.0 \
@@ -147,6 +147,8 @@ python inference_25d.py \
   --device cuda --output-dir inference_output_25d
 ```
 
+When a body mask is available, generated CT voxels outside it are set to **-1** in the model's output scale, which maps to **0 (black)** in `[0, 1]`. This final-output processing also applies to training/validation previews and flip-augmented sampling; foreground values and sampler dynamics are preserved. Without a mask, the output is left unmasked.
+
 `--ct` is optional; provide it for a reference comparison and center-slice PSNR/SSIM/MAE. `--mask` is optional. `--patch-index`, `--steps`, and `--seed` select the patch and sampling settings. CPU execution is available with `--device cpu`. Output includes `prediction.safetensors` with shape `[1, 1, D, H, W]`, `comparison.png` with a fixed `[-1, 1]` display, and `metrics.json`. Weights load strictly; sharded FSDP checkpoints and automatic EMA restoration are unsupported.
 
 Metrics clamp the predicted center slice to `[-1, 1]`, map images to `[0, 1]`, and use data range 1. With a mask, PSNR/SSIM are computed on images whose background is zeroed; background pixels remain in their calculation. MAE is averaged within the mask. These scores are normalized-intensity metrics, not HU errors, and are not interchangeable with official SynthRAD challenge metrics. There is no complete-volume or held-out test-set evaluation script in this public scope.
@@ -170,7 +172,7 @@ python -m tools.summarize_runs_25d \
 
 ## Hardware and status
 
-The tiny 0.11M-parameter CPU example and one-epoch training check were run successfully. Full-model GPU training was not verified in this session: the NVIDIA driver was unavailable. The showcase run logs a peak allocated GPU memory of **18,531.5 MiB (about 18.1 GiB)** with bf16, gradient checkpointing and batch size 10. This is a recorded allocation, not a minimum VRAM requirement or total device usage; the GPU model and launch settings were not logged. Reduce batch size if needed and measure on your hardware.
+The tiny 0.11M-parameter CPU example and one-epoch training check were run successfully. Full-model GPU training was not verified in this session: the GPU driver was unavailable. The showcase run logs a peak allocated GPU memory of **18,531.5 MiB (about 18.1 GiB)** with bf16, gradient checkpointing and batch size 10. This is a recorded allocation, not a minimum VRAM requirement or total device usage; the GPU model and launch settings were not logged. Reduce batch size if needed and measure on your hardware.
 
 Volume caching holds the full prepared dataset in RAM for each training process. Memory needs depend on volume sizes and process count. bf16 requires hardware support; use `mixed_precision: "no"` when unavailable.
 
