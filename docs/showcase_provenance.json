@@ -1,0 +1,16 @@
+{
+  "run": "20260627_104352_pfgm_fir_25d",
+  "event_tag": "Val_Gen/MRI_Pred_GT_CenterSlice",
+  "event_step": 165,
+  "epoch": 166,
+  "metrics_scope": "Three sampled validation center slices at the same event step",
+  "original_image_sha256": "42c0256d778e71468d1124e87f4305477d52d613e7b979008ba136816d472399",
+  "display": "Original TensorBoard independently normalized tiles; labels and attribution added; intensity normalization not reversed",
+  "dataset": "SynthRAD2023 and SynthRAD2025, as reported by the project author; specific case IDs and edition membership of these tiles not logged",
+  "permission": "Project author explicitly authorized including sample images; dataset-specific license and attribution retained",
+  "dataset_terms": [
+    "https://synthrad2023.grand-challenge.org/Rules/",
+    "https://synthrad2025.grand-challenge.org/data/"
+  ],
+  "checkpoint_note": "No epoch_0166 snapshot; metric images use EMA; historical EMA state was not saved"
+}

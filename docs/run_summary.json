@@ -1,0 +1,2633 @@
+{
+  "scope": "Best observed validation-sample center-slice metrics, not whole-dataset evaluation",
+  "selection": "Maximum val_gen/psnr; SSIM and MAE reported at the same event step",
+  "epoch_convention": "Logged steps are zero-based; displayed epochs are step + 1",
+  "runs": [
+    {
+      "run": "20260623_170534_pfgm_fir_25d",
+      "validation_sample_count": 0,
+      "at_best_psnr": null,
+      "best_ssim": null,
+      "best_mae": null,
+      "best_validation_loss": null,
+      "peak_allocated_gpu_mib": null,
+      "configuration": {
+        "D": 128,
+        "P_mean": -0.8,
+        "P_std": 1.0,
+        "S_churn": 20.0,
+        "S_max": "Infinity",
+        "S_min": 0.0,
+        "S_noise": 1.0,
+        "attention_resolutions": [
+          3,
+          4
+        ],
+        "attention_type": "window",
+        "base_channels": 64,
+        "batch_size": 6,
+        "cache_volumes": true,
+        "cfg_rescale_factor": 0.7,
+        "cfg_scale": 2.0,
+        "cfg_scale_max": 2.0,
+        "cfg_scale_min": 1.0,
+        "channel_mults": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "cond_drop_prob": 0.1,
+        "cond_drop_prob_end_epoch": 0,
+        "ct_pattern": "ct.nii",
+        "deformable_kwargs": {
+          "n_groups": 8,
+          "kv_stride": 2,
+          "offset_range_factor": 4.0,
+          "use_qk_norm": true
+        },
+        "deformable_sfb_kwargs": {
+          "kernel_size": [
+            1,
+            3,
+            3
+          ],
+          "offset_scale": 1.0,
+          "use_modulation": false,
+          "deformable_depth": false
+        },
+        "downsample_strides_3d": [
+          [
+            1,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ]
+        ],
+        "drop_path": 0.1,
+        "dropout": 0.0,
+        "ema_decay": 0.9999,
+        "ema_update_every": 1,
+        "grad_clip": 1.0,
+        "grad_log_interval": 100,
+        "gradient_checkpoint": true,
+        "image_size": 256,
+        "log_every": 5,
+        "log_gradients": true,
+        "log_ode_trajectory": true,
+        "loss_type": "l2",
+        "lr": 0.0001,
+        "mask_outside_value": -1.0,
+        "mask_pattern": "mask",
+        "mask_threshold": -0.7,
+        "masked_loss_ratio": 0.5,
+        "mixed_precision": "bf16",
+        "mlp_ratio": 4.0,
+        "mr_pattern": "mr.nii",
+        "num_bottleneck_blocks": 1,
+        "num_epochs": 200,
+        "num_heads": 8,
+        "num_res_blocks": 1,
+        "num_sample_steps": 40,
+        "num_sfb_blocks": 1,
+        "num_slices": 4,
+        "num_swin_blocks": 2,
+        "num_val_samples": 3,
+        "num_workers": 8,
+        "pfgmpp": true,
+        "radius_emb_dim": 256,
+        "rho": 7.0,
+        "sample_every": 1,
+        "save_every": 5,
+        "seed": 42,
+        "sigma_data": 0.45,
+        "sigma_max": 80.0,
+        "sigma_min": 0.002,
+        "slice_stride": 2,
+        "train_split": 0.9,
+        "tta_flips": [
+          "lr",
+          "ud",
+          "lr_ud"
+        ],
+        "use_body_mask": true,
+        "use_cfg_plus_plus": true,
+        "use_deformable_sfb": true,
+        "use_dynamic_cfg": true,
+        "use_ema": true,
+        "use_masked_loss": false,
+        "use_sfb": true,
+        "use_tta": false,
+        "val_every": 1,
+        "warmup_steps": 500,
+        "weight_decay": 0.01,
+        "window_size": 4,
+        "window_size_3d": {
+          "1": [
+            2,
+            4,
+            4
+          ],
+          "2": [
+            2,
+            4,
+            4
+          ],
+          "3": [
+            1,
+            4,
+            4
+          ]
+        }
+      },
+      "checkpoints": []
+    },
+    {
+      "run": "20260623_170845_pfgm_fir_25d",
+      "validation_sample_count": 103,
+      "at_best_psnr": {
+        "step": 91,
+        "epoch": 92,
+        "psnr": 33.24340057373047,
+        "ssim": 0.941534698009491,
+        "mae": 0.012437859550118446,
+        "logged_comparison_available": true,
+        "exact_epoch_checkpoint": false
+      },
+      "best_ssim": {
+        "step": 91,
+        "epoch": 92,
+        "value": 0.941534698009491
+      },
+      "best_mae": {
+        "step": 91,
+        "epoch": 92,
+        "value": 0.012437859550118446
+      },
+      "best_validation_loss": {
+        "step": 96,
+        "epoch": 97,
+        "value": 0.007213884498924017
+      },
+      "peak_allocated_gpu_mib": {
+        "step": 9,
+        "epoch": 10,
+        "value": 15151.6630859375
+      },
+      "configuration": {
+        "D": 128,
+        "P_mean": -0.8,
+        "P_std": 1.0,
+        "S_churn": 20.0,
+        "S_max": "Infinity",
+        "S_min": 0.0,
+        "S_noise": 1.0,
+        "attention_resolutions": [
+          3,
+          4
+        ],
+        "attention_type": "window",
+        "base_channels": 64,
+        "batch_size": 5,
+        "cache_volumes": true,
+        "cfg_rescale_factor": 0.7,
+        "cfg_scale": 2.0,
+        "cfg_scale_max": 2.0,
+        "cfg_scale_min": 1.0,
+        "channel_mults": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "cond_drop_prob": 0.1,
+        "cond_drop_prob_end_epoch": 0,
+        "ct_pattern": "ct.nii",
+        "deformable_kwargs": {
+          "n_groups": 8,
+          "kv_stride": 2,
+          "offset_range_factor": 4.0,
+          "use_qk_norm": true
+        },
+        "deformable_sfb_kwargs": {
+          "kernel_size": [
+            1,
+            3,
+            3
+          ],
+          "offset_scale": 1.0,
+          "use_modulation": false,
+          "deformable_depth": false
+        },
+        "downsample_strides_3d": [
+          [
+            1,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ]
+        ],
+        "drop_path": 0.1,
+        "dropout": 0.0,
+        "ema_decay": 0.9999,
+        "ema_update_every": 1,
+        "grad_clip": 1.0,
+        "grad_log_interval": 100,
+        "gradient_checkpoint": true,
+        "image_size": 256,
+        "log_every": 5,
+        "log_gradients": true,
+        "log_ode_trajectory": true,
+        "loss_type": "l2",
+        "lr": 0.0001,
+        "mask_outside_value": -1.0,
+        "mask_pattern": "mask",
+        "mask_threshold": -0.7,
+        "masked_loss_ratio": 0.5,
+        "mixed_precision": "bf16",
+        "mlp_ratio": 4.0,
+        "mr_pattern": "mr.nii",
+        "num_bottleneck_blocks": 1,
+        "num_epochs": 200,
+        "num_heads": 8,
+        "num_res_blocks": 1,
+        "num_sample_steps": 40,
+        "num_sfb_blocks": 1,
+        "num_slices": 4,
+        "num_swin_blocks": 2,
+        "num_val_samples": 3,
+        "num_workers": 8,
+        "pfgmpp": true,
+        "radius_emb_dim": 256,
+        "rho": 7.0,
+        "sample_every": 1,
+        "save_every": 5,
+        "seed": 42,
+        "sigma_data": 0.45,
+        "sigma_max": 80.0,
+        "sigma_min": 0.002,
+        "slice_stride": 2,
+        "train_split": 0.9,
+        "tta_flips": [
+          "lr",
+          "ud",
+          "lr_ud"
+        ],
+        "use_body_mask": true,
+        "use_cfg_plus_plus": true,
+        "use_deformable_sfb": true,
+        "use_dynamic_cfg": true,
+        "use_ema": true,
+        "use_masked_loss": false,
+        "use_sfb": true,
+        "use_tta": false,
+        "val_every": 1,
+        "warmup_steps": 500,
+        "weight_decay": 0.01,
+        "window_size": 4,
+        "window_size_3d": {
+          "1": [
+            2,
+            4,
+            4
+          ],
+          "2": [
+            2,
+            4,
+            4
+          ],
+          "3": [
+            1,
+            4,
+            4
+          ]
+        }
+      },
+      "checkpoints": [
+        "best",
+        "epoch_0005",
+        "epoch_0010",
+        "epoch_0015",
+        "epoch_0020",
+        "epoch_0025",
+        "epoch_0030",
+        "epoch_0035",
+        "epoch_0040",
+        "epoch_0045",
+        "epoch_0050",
+        "epoch_0055",
+        "epoch_0060",
+        "epoch_0065",
+        "epoch_0070",
+        "epoch_0075",
+        "epoch_0080",
+        "epoch_0085",
+        "epoch_0090",
+        "epoch_0095",
+        "epoch_0100"
+      ]
+    },
+    {
+      "run": "20260623_170925_pfgm_fir_25d",
+      "validation_sample_count": 200,
+      "at_best_psnr": {
+        "step": 191,
+        "epoch": 192,
+        "psnr": 33.876922607421875,
+        "ssim": 0.9494767785072327,
+        "mae": 0.014433490112423897,
+        "logged_comparison_available": true,
+        "exact_epoch_checkpoint": false
+      },
+      "best_ssim": {
+        "step": 191,
+        "epoch": 192,
+        "value": 0.9494767785072327
+      },
+      "best_mae": {
+        "step": 141,
+        "epoch": 142,
+        "value": 0.011567332781851292
+      },
+      "best_validation_loss": {
+        "step": 129,
+        "epoch": 130,
+        "value": 0.006650553084909916
+      },
+      "peak_allocated_gpu_mib": {
+        "step": 132,
+        "epoch": 133,
+        "value": 9743.4560546875
+      },
+      "configuration": {
+        "D": 128,
+        "P_mean": -0.8,
+        "P_std": 1.0,
+        "S_churn": 20.0,
+        "S_max": "Infinity",
+        "S_min": 0.0,
+        "S_noise": 1.0,
+        "attention_resolutions": [
+          3,
+          4
+        ],
+        "attention_type": "window",
+        "base_channels": 64,
+        "batch_size": 5,
+        "cache_volumes": true,
+        "cfg_rescale_factor": 0.7,
+        "cfg_scale": 2.0,
+        "cfg_scale_max": 2.0,
+        "cfg_scale_min": 1.0,
+        "channel_mults": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "cond_drop_prob": 0.1,
+        "cond_drop_prob_end_epoch": 0,
+        "ct_pattern": "ct.nii",
+        "deformable_kwargs": {
+          "n_groups": 8,
+          "kv_stride": 2,
+          "offset_range_factor": 4.0,
+          "use_qk_norm": true
+        },
+        "deformable_sfb_kwargs": {
+          "kernel_size": [
+            1,
+            3,
+            3
+          ],
+          "offset_scale": 1.0,
+          "use_modulation": false,
+          "deformable_depth": false
+        },
+        "downsample_strides_3d": [
+          [
+            1,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ]
+        ],
+        "drop_path": 0.1,
+        "dropout": 0.0,
+        "ema_decay": 0.9999,
+        "ema_update_every": 1,
+        "grad_clip": 1.0,
+        "grad_log_interval": 100,
+        "gradient_checkpoint": true,
+        "image_size": 256,
+        "log_every": 5,
+        "log_gradients": true,
+        "log_ode_trajectory": true,
+        "loss_type": "l2",
+        "lr": 0.0001,
+        "mask_outside_value": -1.0,
+        "mask_pattern": "mask",
+        "mask_threshold": -0.7,
+        "masked_loss_ratio": 0.5,
+        "mixed_precision": "bf16",
+        "mlp_ratio": 4.0,
+        "mr_pattern": "mr.nii",
+        "num_bottleneck_blocks": 1,
+        "num_epochs": 200,
+        "num_heads": 8,
+        "num_res_blocks": 1,
+        "num_sample_steps": 40,
+        "num_sfb_blocks": 1,
+        "num_slices": 4,
+        "num_swin_blocks": 2,
+        "num_val_samples": 3,
+        "num_workers": 8,
+        "pfgmpp": true,
+        "radius_emb_dim": 256,
+        "rho": 7.0,
+        "sample_every": 1,
+        "save_every": 5,
+        "seed": 42,
+        "sigma_data": 0.45,
+        "sigma_max": 80.0,
+        "sigma_min": 0.002,
+        "slice_stride": 2,
+        "train_split": 0.9,
+        "tta_flips": [
+          "lr",
+          "ud",
+          "lr_ud"
+        ],
+        "use_body_mask": true,
+        "use_cfg_plus_plus": true,
+        "use_deformable_sfb": false,
+        "use_dynamic_cfg": true,
+        "use_ema": true,
+        "use_masked_loss": false,
+        "use_sfb": true,
+        "use_tta": false,
+        "val_every": 1,
+        "warmup_steps": 500,
+        "weight_decay": 0.01,
+        "window_size": 4,
+        "window_size_3d": {
+          "1": [
+            2,
+            4,
+            4
+          ],
+          "2": [
+            2,
+            4,
+            4
+          ],
+          "3": [
+            1,
+            4,
+            4
+          ]
+        }
+      },
+      "checkpoints": [
+        "best",
+        "epoch_0005",
+        "epoch_0010",
+        "epoch_0015",
+        "epoch_0020",
+        "epoch_0025",
+        "epoch_0030",
+        "epoch_0035",
+        "epoch_0040",
+        "epoch_0045",
+        "epoch_0050",
+        "epoch_0055",
+        "epoch_0060",
+        "epoch_0065",
+        "epoch_0070",
+        "epoch_0075",
+        "epoch_0080",
+        "epoch_0085",
+        "epoch_0090",
+        "epoch_0095",
+        "epoch_0100",
+        "epoch_0105",
+        "epoch_0110",
+        "epoch_0115",
+        "epoch_0120",
+        "epoch_0125",
+        "epoch_0130",
+        "epoch_0135",
+        "epoch_0140",
+        "epoch_0145",
+        "epoch_0150",
+        "epoch_0155",
+        "epoch_0160",
+        "epoch_0165",
+        "epoch_0170",
+        "epoch_0175",
+        "epoch_0180",
+        "epoch_0185",
+        "epoch_0190",
+        "epoch_0195",
+        "epoch_0200",
+        "final"
+      ]
+    },
+    {
+      "run": "20260627_101540_pfgm_fir_25d",
+      "validation_sample_count": 1,
+      "at_best_psnr": {
+        "step": 0,
+        "epoch": 1,
+        "psnr": 25.656551361083984,
+        "ssim": 0.8272467255592346,
+        "mae": 0.0404939204454422,
+        "logged_comparison_available": true,
+        "exact_epoch_checkpoint": false
+      },
+      "best_ssim": {
+        "step": 0,
+        "epoch": 1,
+        "value": 0.8272467255592346
+      },
+      "best_mae": {
+        "step": 0,
+        "epoch": 1,
+        "value": 0.0404939204454422
+      },
+      "best_validation_loss": {
+        "step": 0,
+        "epoch": 1,
+        "value": 0.02110348828136921
+      },
+      "peak_allocated_gpu_mib": {
+        "step": 0,
+        "epoch": 1,
+        "value": 9652.798828125
+      },
+      "configuration": {
+        "D": 128,
+        "P_mean": -0.8,
+        "P_std": 1.0,
+        "S_churn": 20.0,
+        "S_max": "Infinity",
+        "S_min": 0.0,
+        "S_noise": 1.0,
+        "attention_resolutions": [
+          3,
+          4
+        ],
+        "attention_type": "deformable",
+        "base_channels": 64,
+        "batch_size": 5,
+        "cache_volumes": true,
+        "cfg_rescale_factor": 0.7,
+        "cfg_scale": 2.0,
+        "cfg_scale_max": 2.0,
+        "cfg_scale_min": 1.0,
+        "channel_mults": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "cond_drop_prob": 0.1,
+        "cond_drop_prob_end_epoch": 0,
+        "ct_pattern": "ct.nii",
+        "deformable_kwargs": {
+          "n_groups": 8,
+          "kv_stride": 2,
+          "offset_range_factor": 4.0,
+          "use_qk_norm": true
+        },
+        "deformable_sfb_kwargs": {
+          "kernel_size": [
+            1,
+            3,
+            3
+          ],
+          "offset_scale": 1.0,
+          "use_modulation": false,
+          "deformable_depth": false
+        },
+        "downsample_strides_3d": [
+          [
+            1,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ]
+        ],
+        "drop_path": 0.1,
+        "dropout": 0.0,
+        "ema_decay": 0.9999,
+        "ema_update_every": 1,
+        "grad_clip": 1.0,
+        "grad_log_interval": 100,
+        "gradient_checkpoint": true,
+        "image_size": 256,
+        "log_every": 5,
+        "log_gradients": true,
+        "log_ode_trajectory": true,
+        "loss_type": "l2",
+        "lr": 0.0001,
+        "mask_outside_value": -1.0,
+        "mask_pattern": "mask",
+        "mask_threshold": -0.7,
+        "masked_loss_ratio": 0.5,
+        "mixed_precision": "bf16",
+        "mlp_ratio": 4.0,
+        "mr_pattern": "mr.nii",
+        "num_bottleneck_blocks": 1,
+        "num_epochs": 200,
+        "num_heads": 8,
+        "num_res_blocks": 1,
+        "num_sample_steps": 40,
+        "num_sfb_blocks": 1,
+        "num_slices": 4,
+        "num_swin_blocks": 2,
+        "num_val_samples": 3,
+        "num_workers": 8,
+        "pfgmpp": true,
+        "radius_emb_dim": 256,
+        "rho": 7.0,
+        "sample_every": 1,
+        "save_every": 5,
+        "seed": 42,
+        "sigma_data": 0.45,
+        "sigma_max": 80.0,
+        "sigma_min": 0.002,
+        "slice_stride": 2,
+        "train_split": 0.9,
+        "tta_flips": [
+          "lr",
+          "ud",
+          "lr_ud"
+        ],
+        "use_body_mask": true,
+        "use_cfg_plus_plus": true,
+        "use_deformable_sfb": false,
+        "use_dynamic_cfg": true,
+        "use_ema": true,
+        "use_masked_loss": false,
+        "use_sfb": true,
+        "use_tta": false,
+        "val_every": 1,
+        "warmup_steps": 500,
+        "weight_decay": 0.01,
+        "window_size": 4,
+        "window_size_3d": {
+          "1": [
+            2,
+            4,
+            4
+          ],
+          "2": [
+            2,
+            4,
+            4
+          ],
+          "3": [
+            1,
+            4,
+            4
+          ]
+        }
+      },
+      "checkpoints": [
+        "best"
+      ]
+    },
+    {
+      "run": "20260627_102241_pfgm_fir_25d",
+      "validation_sample_count": 0,
+      "at_best_psnr": null,
+      "best_ssim": null,
+      "best_mae": null,
+      "best_validation_loss": null,
+      "peak_allocated_gpu_mib": null,
+      "configuration": {
+        "D": 128,
+        "P_mean": -0.8,
+        "P_std": 1.0,
+        "S_churn": 20.0,
+        "S_max": "Infinity",
+        "S_min": 0.0,
+        "S_noise": 1.0,
+        "attention_resolutions": [
+          3,
+          4
+        ],
+        "attention_type": "deformable",
+        "base_channels": 64,
+        "batch_size": 5,
+        "cache_volumes": true,
+        "cfg_rescale_factor": 0.7,
+        "cfg_scale": 2.0,
+        "cfg_scale_max": 2.0,
+        "cfg_scale_min": 1.0,
+        "channel_mults": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "cond_drop_prob": 0.1,
+        "cond_drop_prob_end_epoch": 0,
+        "ct_pattern": "ct.nii",
+        "deformable_kwargs": {
+          "n_groups": 8,
+          "kv_stride": 1,
+          "offset_range_factor": 4.0,
+          "use_qk_norm": true
+        },
+        "deformable_sfb_kwargs": {
+          "kernel_size": [
+            1,
+            3,
+            3
+          ],
+          "offset_scale": 1.0,
+          "use_modulation": false,
+          "deformable_depth": false
+        },
+        "downsample_strides_3d": [
+          [
+            1,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ]
+        ],
+        "drop_path": 0.1,
+        "dropout": 0.0,
+        "ema_decay": 0.9999,
+        "ema_update_every": 1,
+        "grad_clip": 1.0,
+        "grad_log_interval": 100,
+        "gradient_checkpoint": true,
+        "image_size": 256,
+        "log_every": 5,
+        "log_gradients": true,
+        "log_ode_trajectory": true,
+        "loss_type": "l2",
+        "lr": 0.0001,
+        "mask_outside_value": -1.0,
+        "mask_pattern": "mask",
+        "mask_threshold": -0.7,
+        "masked_loss_ratio": 0.5,
+        "mixed_precision": "bf16",
+        "mlp_ratio": 4.0,
+        "mr_pattern": "mr.nii",
+        "num_bottleneck_blocks": 1,
+        "num_epochs": 200,
+        "num_heads": 8,
+        "num_res_blocks": 1,
+        "num_sample_steps": 40,
+        "num_sfb_blocks": 1,
+        "num_slices": 4,
+        "num_swin_blocks": 2,
+        "num_val_samples": 3,
+        "num_workers": 8,
+        "pfgmpp": true,
+        "radius_emb_dim": 256,
+        "rho": 7.0,
+        "sample_every": 1,
+        "save_every": 5,
+        "seed": 42,
+        "sigma_data": 0.45,
+        "sigma_max": 80.0,
+        "sigma_min": 0.002,
+        "slice_stride": 2,
+        "train_split": 0.9,
+        "tta_flips": [
+          "lr",
+          "ud",
+          "lr_ud"
+        ],
+        "use_body_mask": true,
+        "use_cfg_plus_plus": true,
+        "use_deformable_sfb": false,
+        "use_dynamic_cfg": true,
+        "use_ema": true,
+        "use_masked_loss": false,
+        "use_sfb": true,
+        "use_tta": false,
+        "val_every": 1,
+        "warmup_steps": 500,
+        "weight_decay": 0.01,
+        "window_size": 4,
+        "window_size_3d": {
+          "1": [
+            2,
+            4,
+            4
+          ],
+          "2": [
+            2,
+            4,
+            4
+          ],
+          "3": [
+            1,
+            4,
+            4
+          ]
+        }
+      },
+      "checkpoints": []
+    },
+    {
+      "run": "20260627_104045_pfgm_fir_25d",
+      "validation_sample_count": 200,
+      "at_best_psnr": {
+        "step": 185,
+        "epoch": 186,
+        "psnr": 33.86119842529297,
+        "ssim": 0.9302416443824768,
+        "mae": 0.014193961396813393,
+        "logged_comparison_available": true,
+        "exact_epoch_checkpoint": false
+      },
+      "best_ssim": {
+        "step": 139,
+        "epoch": 140,
+        "value": 0.9336483478546143
+      },
+      "best_mae": {
+        "step": 158,
+        "epoch": 159,
+        "value": 0.013115430250763893
+      },
+      "best_validation_loss": {
+        "step": 182,
+        "epoch": 183,
+        "value": 0.006529476493597031
+      },
+      "peak_allocated_gpu_mib": {
+        "step": 188,
+        "epoch": 189,
+        "value": 18530.26171875
+      },
+      "configuration": {
+        "D": 128,
+        "P_mean": -0.8,
+        "P_std": 1.0,
+        "S_churn": 20.0,
+        "S_max": "Infinity",
+        "S_min": 0.0,
+        "S_noise": 1.0,
+        "attention_resolutions": [
+          3,
+          4
+        ],
+        "attention_type": "deformable",
+        "base_channels": 64,
+        "batch_size": 10,
+        "cache_volumes": true,
+        "cfg_rescale_factor": 0.7,
+        "cfg_scale": 2.0,
+        "cfg_scale_max": 2.0,
+        "cfg_scale_min": 1.0,
+        "channel_mults": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "cond_drop_prob": 0.1,
+        "cond_drop_prob_end_epoch": 0,
+        "ct_pattern": "ct.nii",
+        "deformable_kwargs": {
+          "n_groups": 8,
+          "kv_stride": 1,
+          "offset_range_factor": 4.0,
+          "use_qk_norm": true
+        },
+        "deformable_sfb_kwargs": {
+          "kernel_size": [
+            1,
+            3,
+            3
+          ],
+          "offset_scale": 1.0,
+          "use_modulation": false,
+          "deformable_depth": false
+        },
+        "downsample_strides_3d": [
+          [
+            1,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ]
+        ],
+        "drop_path": 0.1,
+        "dropout": 0.0,
+        "ema_decay": 0.9999,
+        "ema_update_every": 1,
+        "grad_clip": 1.0,
+        "grad_log_interval": 100,
+        "gradient_checkpoint": true,
+        "image_size": 256,
+        "log_every": 5,
+        "log_gradients": true,
+        "log_ode_trajectory": true,
+        "loss_type": "l2",
+        "lr": 0.0001,
+        "mask_outside_value": -1.0,
+        "mask_pattern": "mask",
+        "mask_threshold": -0.7,
+        "masked_loss_ratio": 0.5,
+        "mixed_precision": "bf16",
+        "mlp_ratio": 4.0,
+        "mr_pattern": "mr.nii",
+        "num_bottleneck_blocks": 1,
+        "num_epochs": 200,
+        "num_heads": 8,
+        "num_res_blocks": 1,
+        "num_sample_steps": 40,
+        "num_sfb_blocks": 1,
+        "num_slices": 4,
+        "num_swin_blocks": 2,
+        "num_val_samples": 3,
+        "num_workers": 8,
+        "pfgmpp": true,
+        "radius_emb_dim": 256,
+        "rho": 7.0,
+        "sample_every": 1,
+        "save_every": 5,
+        "seed": 42,
+        "sigma_data": 0.45,
+        "sigma_max": 80.0,
+        "sigma_min": 0.002,
+        "slice_stride": 2,
+        "train_split": 0.9,
+        "tta_flips": [
+          "lr",
+          "ud",
+          "lr_ud"
+        ],
+        "use_body_mask": true,
+        "use_cfg_plus_plus": true,
+        "use_deformable_sfb": false,
+        "use_dynamic_cfg": true,
+        "use_ema": true,
+        "use_masked_loss": false,
+        "use_sfb": true,
+        "use_tta": false,
+        "val_every": 1,
+        "warmup_steps": 500,
+        "weight_decay": 0.01,
+        "window_size": 4,
+        "window_size_3d": {
+          "1": [
+            2,
+            4,
+            4
+          ],
+          "2": [
+            2,
+            4,
+            4
+          ],
+          "3": [
+            1,
+            4,
+            4
+          ]
+        }
+      },
+      "checkpoints": [
+        "best",
+        "epoch_0005",
+        "epoch_0010",
+        "epoch_0015",
+        "epoch_0020",
+        "epoch_0025",
+        "epoch_0030",
+        "epoch_0035",
+        "epoch_0040",
+        "epoch_0045",
+        "epoch_0050",
+        "epoch_0055",
+        "epoch_0060",
+        "epoch_0065",
+        "epoch_0070",
+        "epoch_0075",
+        "epoch_0080",
+        "epoch_0085",
+        "epoch_0090",
+        "epoch_0095",
+        "epoch_0100",
+        "epoch_0105",
+        "epoch_0110",
+        "epoch_0115",
+        "epoch_0120",
+        "epoch_0125",
+        "epoch_0130",
+        "epoch_0135",
+        "epoch_0140",
+        "epoch_0145",
+        "epoch_0150",
+        "epoch_0155",
+        "epoch_0160",
+        "epoch_0165",
+        "epoch_0170",
+        "epoch_0175",
+        "epoch_0180",
+        "epoch_0185",
+        "epoch_0190",
+        "epoch_0195",
+        "epoch_0200",
+        "final"
+      ]
+    },
+    {
+      "run": "20260627_104352_pfgm_fir_25d",
+      "validation_sample_count": 200,
+      "at_best_psnr": {
+        "step": 165,
+        "epoch": 166,
+        "psnr": 34.05976867675781,
+        "ssim": 0.9363517165184021,
+        "mae": 0.01240153145045042,
+        "logged_comparison_available": true,
+        "exact_epoch_checkpoint": false
+      },
+      "best_ssim": {
+        "step": 185,
+        "epoch": 186,
+        "value": 0.9399225115776062
+      },
+      "best_mae": {
+        "step": 165,
+        "epoch": 166,
+        "value": 0.01240153145045042
+      },
+      "best_validation_loss": {
+        "step": 182,
+        "epoch": 183,
+        "value": 0.006606967654079199
+      },
+      "peak_allocated_gpu_mib": {
+        "step": 168,
+        "epoch": 169,
+        "value": 18531.50390625
+      },
+      "configuration": {
+        "D": 128,
+        "P_mean": -0.8,
+        "P_std": 1.0,
+        "S_churn": 20.0,
+        "S_max": "Infinity",
+        "S_min": 0.0,
+        "S_noise": 1.0,
+        "attention_resolutions": [
+          3,
+          4
+        ],
+        "attention_type": "deformable",
+        "base_channels": 64,
+        "batch_size": 10,
+        "cache_volumes": true,
+        "cfg_rescale_factor": 0.7,
+        "cfg_scale": 2.0,
+        "cfg_scale_max": 2.0,
+        "cfg_scale_min": 1.0,
+        "channel_mults": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "cond_drop_prob": 0.1,
+        "cond_drop_prob_end_epoch": 0,
+        "ct_pattern": "ct.nii",
+        "deformable_kwargs": {
+          "n_groups": 8,
+          "kv_stride": 2,
+          "offset_range_factor": 4.0,
+          "use_qk_norm": true
+        },
+        "deformable_sfb_kwargs": {
+          "kernel_size": [
+            1,
+            3,
+            3
+          ],
+          "offset_scale": 1.0,
+          "use_modulation": false,
+          "deformable_depth": false
+        },
+        "downsample_strides_3d": [
+          [
+            1,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ]
+        ],
+        "drop_path": 0.1,
+        "dropout": 0.0,
+        "ema_decay": 0.9999,
+        "ema_update_every": 1,
+        "grad_clip": 1.0,
+        "grad_log_interval": 100,
+        "gradient_checkpoint": true,
+        "image_size": 256,
+        "log_every": 5,
+        "log_gradients": true,
+        "log_ode_trajectory": true,
+        "loss_type": "l2",
+        "lr": 0.0001,
+        "mask_outside_value": -1.0,
+        "mask_pattern": "mask",
+        "mask_threshold": -0.7,
+        "masked_loss_ratio": 0.5,
+        "mixed_precision": "bf16",
+        "mlp_ratio": 4.0,
+        "mr_pattern": "mr.nii",
+        "num_bottleneck_blocks": 1,
+        "num_epochs": 200,
+        "num_heads": 8,
+        "num_res_blocks": 1,
+        "num_sample_steps": 40,
+        "num_sfb_blocks": 1,
+        "num_slices": 4,
+        "num_swin_blocks": 2,
+        "num_val_samples": 3,
+        "num_workers": 8,
+        "pfgmpp": true,
+        "radius_emb_dim": 256,
+        "rho": 7.0,
+        "sample_every": 1,
+        "save_every": 5,
+        "seed": 42,
+        "sigma_data": 0.45,
+        "sigma_max": 80.0,
+        "sigma_min": 0.002,
+        "slice_stride": 2,
+        "train_split": 0.9,
+        "tta_flips": [
+          "lr",
+          "ud",
+          "lr_ud"
+        ],
+        "use_body_mask": true,
+        "use_cfg_plus_plus": true,
+        "use_deformable_sfb": false,
+        "use_dynamic_cfg": true,
+        "use_ema": true,
+        "use_masked_loss": false,
+        "use_sfb": true,
+        "use_tta": false,
+        "val_every": 1,
+        "warmup_steps": 500,
+        "weight_decay": 0.01,
+        "window_size": 4,
+        "window_size_3d": {
+          "1": [
+            2,
+            4,
+            4
+          ],
+          "2": [
+            2,
+            4,
+            4
+          ],
+          "3": [
+            1,
+            4,
+            4
+          ]
+        }
+      },
+      "checkpoints": [
+        "best",
+        "epoch_0005",
+        "epoch_0010",
+        "epoch_0015",
+        "epoch_0020",
+        "epoch_0025",
+        "epoch_0030",
+        "epoch_0035",
+        "epoch_0040",
+        "epoch_0045",
+        "epoch_0050",
+        "epoch_0055",
+        "epoch_0060",
+        "epoch_0065",
+        "epoch_0070",
+        "epoch_0075",
+        "epoch_0080",
+        "epoch_0085",
+        "epoch_0090",
+        "epoch_0095",
+        "epoch_0100",
+        "epoch_0105",
+        "epoch_0110",
+        "epoch_0115",
+        "epoch_0120",
+        "epoch_0125",
+        "epoch_0130",
+        "epoch_0135",
+        "epoch_0140",
+        "epoch_0145",
+        "epoch_0150",
+        "epoch_0155",
+        "epoch_0160",
+        "epoch_0165",
+        "epoch_0170",
+        "epoch_0175",
+        "epoch_0180",
+        "epoch_0185",
+        "epoch_0190",
+        "epoch_0195",
+        "epoch_0200",
+        "final"
+      ]
+    },
+    {
+      "run": "20260710_191946_pfgm_fir_25d",
+      "validation_sample_count": 200,
+      "at_best_psnr": {
+        "step": 185,
+        "epoch": 186,
+        "psnr": 33.8852653503418,
+        "ssim": 0.9432937502861023,
+        "mae": 0.012806246057152748,
+        "logged_comparison_available": true,
+        "exact_epoch_checkpoint": false
+      },
+      "best_ssim": {
+        "step": 185,
+        "epoch": 186,
+        "value": 0.9432937502861023
+      },
+      "best_mae": {
+        "step": 165,
+        "epoch": 166,
+        "value": 0.012638190761208534
+      },
+      "best_validation_loss": {
+        "step": 182,
+        "epoch": 183,
+        "value": 0.006575869861990213
+      },
+      "peak_allocated_gpu_mib": {
+        "step": 168,
+        "epoch": 169,
+        "value": 18531.50390625
+      },
+      "configuration": {
+        "D": 128,
+        "P_mean": -0.8,
+        "P_std": 1.0,
+        "S_churn": 20.0,
+        "S_max": "Infinity",
+        "S_min": 0.0,
+        "S_noise": 1.0,
+        "attention_resolutions": [
+          3,
+          4
+        ],
+        "attention_type": "deformable",
+        "base_channels": 64,
+        "batch_size": 10,
+        "cache_volumes": true,
+        "cfg_rescale_factor": 0.7,
+        "cfg_scale": 2.0,
+        "cfg_scale_max": 2.0,
+        "cfg_scale_min": 1.0,
+        "channel_mults": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "cond_drop_prob": 0.1,
+        "cond_drop_prob_end_epoch": 0,
+        "ct_pattern": "ct.nii",
+        "deformable_kwargs": {
+          "n_groups": 8,
+          "kv_stride": 2,
+          "offset_range_factor": 8.0,
+          "use_qk_norm": true
+        },
+        "deformable_sfb_kwargs": {
+          "kernel_size": [
+            1,
+            3,
+            3
+          ],
+          "offset_scale": 1.0,
+          "use_modulation": false,
+          "deformable_depth": false
+        },
+        "downsample_strides_3d": [
+          [
+            1,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ]
+        ],
+        "drop_path": 0.1,
+        "dropout": 0.0,
+        "ema_decay": 0.9999,
+        "ema_update_every": 1,
+        "grad_clip": 1.0,
+        "grad_log_interval": 100,
+        "gradient_checkpoint": true,
+        "image_size": 256,
+        "log_every": 5,
+        "log_gradients": true,
+        "log_ode_trajectory": true,
+        "loss_type": "l2",
+        "lr": 0.0001,
+        "mask_outside_value": -1.0,
+        "mask_pattern": "mask",
+        "mask_threshold": -0.7,
+        "masked_loss_ratio": 0.5,
+        "mixed_precision": "bf16",
+        "mlp_ratio": 4.0,
+        "mr_pattern": "mr.nii",
+        "num_bottleneck_blocks": 1,
+        "num_epochs": 200,
+        "num_heads": 8,
+        "num_res_blocks": 1,
+        "num_sample_steps": 40,
+        "num_sfb_blocks": 1,
+        "num_slices": 4,
+        "num_swin_blocks": 2,
+        "num_val_samples": 3,
+        "num_workers": 8,
+        "pfgmpp": true,
+        "radius_emb_dim": 256,
+        "rho": 7.0,
+        "sample_every": 1,
+        "save_every": 5,
+        "seed": 42,
+        "sigma_data": 0.45,
+        "sigma_max": 80.0,
+        "sigma_min": 0.002,
+        "slice_stride": 2,
+        "train_split": 0.9,
+        "tta_flips": [
+          "lr",
+          "ud",
+          "lr_ud"
+        ],
+        "use_body_mask": true,
+        "use_cfg_plus_plus": true,
+        "use_deformable_sfb": false,
+        "use_dynamic_cfg": true,
+        "use_ema": true,
+        "use_masked_loss": false,
+        "use_sfb": true,
+        "use_tta": false,
+        "val_every": 1,
+        "warmup_steps": 500,
+        "weight_decay": 0.01,
+        "window_size": 4,
+        "window_size_3d": {
+          "1": [
+            2,
+            4,
+            4
+          ],
+          "2": [
+            2,
+            4,
+            4
+          ],
+          "3": [
+            1,
+            4,
+            4
+          ]
+        }
+      },
+      "checkpoints": [
+        "best",
+        "epoch_0005",
+        "epoch_0010",
+        "epoch_0015",
+        "epoch_0020",
+        "epoch_0025",
+        "epoch_0030",
+        "epoch_0035",
+        "epoch_0040",
+        "epoch_0045",
+        "epoch_0050",
+        "epoch_0055",
+        "epoch_0060",
+        "epoch_0065",
+        "epoch_0070",
+        "epoch_0075",
+        "epoch_0080",
+        "epoch_0085",
+        "epoch_0090",
+        "epoch_0095",
+        "epoch_0100",
+        "epoch_0105",
+        "epoch_0110",
+        "epoch_0115",
+        "epoch_0120",
+        "epoch_0125",
+        "epoch_0130",
+        "epoch_0135",
+        "epoch_0140",
+        "epoch_0145",
+        "epoch_0150",
+        "epoch_0155",
+        "epoch_0160",
+        "epoch_0165",
+        "epoch_0170",
+        "epoch_0175",
+        "epoch_0180",
+        "epoch_0185",
+        "epoch_0190",
+        "epoch_0195",
+        "epoch_0200",
+        "final"
+      ]
+    },
+    {
+      "run": "20260713_160125_pfgm_fir_25d",
+      "validation_sample_count": 1,
+      "at_best_psnr": {
+        "step": 0,
+        "epoch": 1,
+        "psnr": 24.537614822387695,
+        "ssim": 0.7815001010894775,
+        "mae": 0.05037152022123337,
+        "logged_comparison_available": true,
+        "exact_epoch_checkpoint": false
+      },
+      "best_ssim": {
+        "step": 0,
+        "epoch": 1,
+        "value": 0.7815001010894775
+      },
+      "best_mae": {
+        "step": 0,
+        "epoch": 1,
+        "value": 0.05037152022123337
+      },
+      "best_validation_loss": {
+        "step": 0,
+        "epoch": 1,
+        "value": 0.026719698682427406
+      },
+      "peak_allocated_gpu_mib": {
+        "step": 0,
+        "epoch": 1,
+        "value": 18448.01171875
+      },
+      "configuration": {
+        "D": 128,
+        "P_mean": -0.8,
+        "P_std": 1.0,
+        "S_churn": 20.0,
+        "S_max": "Infinity",
+        "S_min": 0.0,
+        "S_noise": 1.0,
+        "attention_resolutions": [
+          3,
+          4
+        ],
+        "attention_type": "deformable",
+        "base_channels": 64,
+        "batch_size": 10,
+        "cache_volumes": true,
+        "cfg_rescale_factor": 0.7,
+        "cfg_scale": 2.0,
+        "cfg_scale_max": 2.0,
+        "cfg_scale_min": 1.0,
+        "channel_mults": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "cond_drop_prob": 0.1,
+        "cond_drop_prob_end_epoch": 0,
+        "ct_pattern": "ct.nii",
+        "deformable_kwargs": {
+          "n_groups": 8,
+          "kv_stride": 2,
+          "offset_range_factor": 8.0,
+          "use_qk_norm": true
+        },
+        "deformable_sfb_kwargs": {
+          "kernel_size": [
+            1,
+            3,
+            3
+          ],
+          "offset_scale": 1.0,
+          "use_modulation": false,
+          "deformable_depth": false
+        },
+        "downsample_strides_3d": [
+          [
+            1,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ]
+        ],
+        "drop_path": 0.1,
+        "dropout": 0.0,
+        "ema_decay": 0.9999,
+        "ema_update_every": 1,
+        "grad_clip": 1.0,
+        "grad_log_interval": 100,
+        "gradient_checkpoint": true,
+        "image_size": 256,
+        "log_every": 5,
+        "log_gradients": true,
+        "log_ode_trajectory": true,
+        "loss_type": "l2",
+        "lr": 0.0001,
+        "mask_outside_value": -1.0,
+        "mask_pattern": "mask",
+        "mask_threshold": -0.7,
+        "masked_loss_ratio": 0.5,
+        "mixed_precision": "bf16",
+        "mlp_ratio": 4.0,
+        "mr_pattern": "mr.nii",
+        "num_bottleneck_blocks": 1,
+        "num_epochs": 300,
+        "num_heads": 8,
+        "num_res_blocks": 1,
+        "num_sample_steps": 40,
+        "num_sfb_blocks": 1,
+        "num_slices": 4,
+        "num_swin_blocks": 2,
+        "num_val_samples": 3,
+        "num_workers": 8,
+        "pfgmpp": true,
+        "radius_emb_dim": 256,
+        "rho": 7.0,
+        "sample_every": 1,
+        "save_every": 20,
+        "seed": 42,
+        "sigma_data": 0.45,
+        "sigma_max": 80.0,
+        "sigma_min": 0.002,
+        "slice_stride": 2,
+        "train_split": 0.9,
+        "tta_flips": [
+          "lr",
+          "ud",
+          "lr_ud"
+        ],
+        "use_body_mask": true,
+        "use_cfg_plus_plus": true,
+        "use_deformable_sfb": false,
+        "use_dynamic_cfg": true,
+        "use_ema": true,
+        "use_masked_loss": false,
+        "use_sfb": true,
+        "use_tta": false,
+        "val_every": 1,
+        "warmup_steps": 500,
+        "weight_decay": 0.01,
+        "window_size": 4,
+        "window_size_3d": {
+          "1": [
+            2,
+            4,
+            4
+          ],
+          "2": [
+            2,
+            4,
+            4
+          ],
+          "3": [
+            1,
+            4,
+            4
+          ]
+        }
+      },
+      "checkpoints": [
+        "best"
+      ]
+    },
+    {
+      "run": "20260713_174617_pfgm_fir_25d",
+      "validation_sample_count": 259,
+      "at_best_psnr": {
+        "step": 240,
+        "epoch": 241,
+        "psnr": 34.014766693115234,
+        "ssim": 0.9403827786445618,
+        "mae": 0.01362778153270483,
+        "logged_comparison_available": true,
+        "exact_epoch_checkpoint": false
+      },
+      "best_ssim": {
+        "step": 221,
+        "epoch": 222,
+        "value": 0.9478523135185242
+      },
+      "best_mae": {
+        "step": 158,
+        "epoch": 159,
+        "value": 0.012719417922198772
+      },
+      "best_validation_loss": {
+        "step": 215,
+        "epoch": 216,
+        "value": 0.006538242567330599
+      },
+      "peak_allocated_gpu_mib": {
+        "step": 168,
+        "epoch": 169,
+        "value": 18531.50390625
+      },
+      "configuration": {
+        "D": 128,
+        "P_mean": -0.8,
+        "P_std": 1.0,
+        "S_churn": 20.0,
+        "S_max": "Infinity",
+        "S_min": 0.0,
+        "S_noise": 1.0,
+        "attention_resolutions": [
+          3,
+          4
+        ],
+        "attention_type": "deformable",
+        "base_channels": 64,
+        "batch_size": 10,
+        "cache_volumes": true,
+        "cfg_rescale_factor": 0.7,
+        "cfg_scale": 2.0,
+        "cfg_scale_max": 2.0,
+        "cfg_scale_min": 1.0,
+        "channel_mults": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "cond_drop_prob": 0.1,
+        "cond_drop_prob_end_epoch": 0,
+        "ct_pattern": "ct.nii",
+        "deformable_kwargs": {
+          "n_groups": 8,
+          "kv_stride": 2,
+          "offset_range_factor": 8.0,
+          "use_qk_norm": true
+        },
+        "deformable_sfb_kwargs": {
+          "kernel_size": [
+            1,
+            3,
+            3
+          ],
+          "offset_scale": 1.0,
+          "use_modulation": false,
+          "deformable_depth": false
+        },
+        "downsample_strides_3d": [
+          [
+            1,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ]
+        ],
+        "drop_path": 0.1,
+        "dropout": 0.0,
+        "ema_decay": 0.9999,
+        "ema_update_every": 1,
+        "grad_clip": 1.0,
+        "grad_log_interval": 100,
+        "gradient_checkpoint": true,
+        "image_size": 256,
+        "log_every": 5,
+        "log_gradients": true,
+        "log_ode_trajectory": true,
+        "loss_type": "l2",
+        "lr": 0.0001,
+        "mask_outside_value": -1.0,
+        "mask_pattern": "mask",
+        "mask_threshold": -0.7,
+        "masked_loss_ratio": 0.5,
+        "mixed_precision": "bf16",
+        "mlp_ratio": 4.0,
+        "mr_pattern": "mr.nii",
+        "num_bottleneck_blocks": 1,
+        "num_epochs": 300,
+        "num_heads": 8,
+        "num_res_blocks": 1,
+        "num_sample_steps": 40,
+        "num_sfb_blocks": 1,
+        "num_slices": 4,
+        "num_swin_blocks": 2,
+        "num_val_samples": 3,
+        "num_workers": 8,
+        "pfgmpp": true,
+        "radius_emb_dim": 256,
+        "rho": 7.0,
+        "sample_every": 1,
+        "save_every": 20,
+        "seed": 42,
+        "sigma_data": 0.45,
+        "sigma_max": 80.0,
+        "sigma_min": 0.002,
+        "slice_stride": 2,
+        "train_split": 0.9,
+        "tta_flips": [
+          "lr",
+          "ud",
+          "lr_ud"
+        ],
+        "use_body_mask": true,
+        "use_cfg_plus_plus": true,
+        "use_deformable_sfb": false,
+        "use_dynamic_cfg": true,
+        "use_ema": true,
+        "use_masked_loss": false,
+        "use_sfb": true,
+        "use_tta": false,
+        "val_every": 1,
+        "warmup_steps": 500,
+        "weight_decay": 0.01,
+        "window_size": 4,
+        "window_size_3d": {
+          "1": [
+            2,
+            4,
+            4
+          ],
+          "2": [
+            2,
+            4,
+            4
+          ],
+          "3": [
+            1,
+            4,
+            4
+          ]
+        }
+      },
+      "checkpoints": [
+        "best",
+        "epoch_0020",
+        "epoch_0040",
+        "epoch_0060",
+        "epoch_0080",
+        "epoch_0100",
+        "epoch_0120",
+        "epoch_0140",
+        "epoch_0160",
+        "epoch_0180",
+        "epoch_0200",
+        "epoch_0220",
+        "epoch_0240"
+      ]
+    },
+    {
+      "run": "20260717_055523_pfgm_fir_25d",
+      "validation_sample_count": 0,
+      "at_best_psnr": null,
+      "best_ssim": null,
+      "best_mae": null,
+      "best_validation_loss": null,
+      "peak_allocated_gpu_mib": null,
+      "configuration": {},
+      "checkpoints": []
+    },
+    {
+      "run": "20260717_060540_pfgm_fir_25d",
+      "validation_sample_count": 0,
+      "at_best_psnr": null,
+      "best_ssim": null,
+      "best_mae": null,
+      "best_validation_loss": null,
+      "peak_allocated_gpu_mib": null,
+      "configuration": {
+        "D": 128,
+        "P_mean": -0.8,
+        "P_std": 1.0,
+        "S_churn": 20.0,
+        "S_max": "Infinity",
+        "S_min": 0.0,
+        "S_noise": 1.0,
+        "attention_resolutions": [
+          3,
+          4
+        ],
+        "attention_type": "deformable",
+        "base_channels": 64,
+        "batch_size": 5,
+        "cache_volumes": true,
+        "cfg_rescale_factor": 0.7,
+        "cfg_scale": 2.0,
+        "cfg_scale_max": 2.0,
+        "cfg_scale_min": 1.0,
+        "channel_mults": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "cond_drop_prob": 0.1,
+        "cond_drop_prob_end_epoch": 0,
+        "ct_pattern": "ct.nii",
+        "deformable_kwargs": {
+          "n_groups": 8,
+          "kv_stride": 1,
+          "offset_range_factor": 8.0,
+          "use_qk_norm": true
+        },
+        "deformable_sfb_kwargs": {
+          "kernel_size": [
+            1,
+            3,
+            3
+          ],
+          "offset_scale": 1.0,
+          "use_modulation": false,
+          "deformable_depth": false
+        },
+        "downsample_strides_3d": [
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            1,
+            2,
+            2
+          ]
+        ],
+        "drop_path": 0.05,
+        "dropout": 0.1,
+        "ema_decay": 0.9999,
+        "ema_update_every": 1,
+        "grad_clip": 1.0,
+        "grad_log_interval": 100,
+        "gradient_checkpoint": true,
+        "image_size": 256,
+        "log_every": 5,
+        "log_gradients": true,
+        "log_ode_trajectory": true,
+        "loss_type": "l2",
+        "lr": 0.0001,
+        "mask_outside_value": -1.0,
+        "mask_pattern": "mask",
+        "mask_threshold": -0.7,
+        "masked_loss_ratio": 0.5,
+        "mixed_precision": "bf16",
+        "mlp_ratio": 4.0,
+        "mr_pattern": "mr.nii",
+        "num_bottleneck_blocks": 1,
+        "num_epochs": 300,
+        "num_heads": 8,
+        "num_res_blocks": 1,
+        "num_sample_steps": 40,
+        "num_sfb_blocks": 1,
+        "num_slices": 4,
+        "num_swin_blocks": 2,
+        "num_val_samples": 3,
+        "num_workers": 8,
+        "pfgmpp": true,
+        "radius_emb_dim": 256,
+        "rho": 7.0,
+        "sample_every": 1,
+        "save_every": 20,
+        "seed": 42,
+        "sigma_data": 0.45,
+        "sigma_max": 80.0,
+        "sigma_min": 0.002,
+        "slice_stride": 2,
+        "train_split": 0.9,
+        "tta_flips": [
+          "lr",
+          "ud",
+          "lr_ud"
+        ],
+        "use_body_mask": true,
+        "use_cfg_plus_plus": true,
+        "use_deformable_sfb": false,
+        "use_dynamic_cfg": true,
+        "use_ema": true,
+        "use_masked_loss": false,
+        "use_sfb": true,
+        "use_tta": false,
+        "val_every": 1,
+        "warmup_steps": 500,
+        "weight_decay": 0.01,
+        "window_size": 4,
+        "window_size_3d": {
+          "1": [
+            2,
+            4,
+            4
+          ],
+          "2": [
+            2,
+            4,
+            4
+          ],
+          "3": [
+            1,
+            4,
+            4
+          ]
+        }
+      },
+      "checkpoints": []
+    },
+    {
+      "run": "20260717_060946_pfgm_fir_25d",
+      "validation_sample_count": 0,
+      "at_best_psnr": null,
+      "best_ssim": null,
+      "best_mae": null,
+      "best_validation_loss": null,
+      "peak_allocated_gpu_mib": null,
+      "configuration": {
+        "D": 128,
+        "P_mean": -0.8,
+        "P_std": 1.0,
+        "S_churn": 20.0,
+        "S_max": "Infinity",
+        "S_min": 0.0,
+        "S_noise": 1.0,
+        "attention_resolutions": [
+          3,
+          4
+        ],
+        "attention_type": "deformable",
+        "base_channels": 64,
+        "batch_size": 5,
+        "cache_volumes": true,
+        "cfg_rescale_factor": 0.7,
+        "cfg_scale": 2.0,
+        "cfg_scale_max": 2.0,
+        "cfg_scale_min": 1.0,
+        "channel_mults": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "cond_drop_prob": 0.1,
+        "cond_drop_prob_end_epoch": 0,
+        "ct_pattern": "ct.nii",
+        "deformable_kwargs": {
+          "n_groups": 8,
+          "kv_stride": 1,
+          "offset_range_factor": 8.0,
+          "use_qk_norm": true
+        },
+        "deformable_sfb_kwargs": {
+          "kernel_size": [
+            1,
+            3,
+            3
+          ],
+          "offset_scale": 1.0,
+          "use_modulation": false,
+          "deformable_depth": false
+        },
+        "downsample_strides_3d": [
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            1,
+            2,
+            2
+          ]
+        ],
+        "drop_path": 0.05,
+        "dropout": 0.1,
+        "ema_decay": 0.9999,
+        "ema_update_every": 1,
+        "grad_clip": 1.0,
+        "grad_log_interval": 100,
+        "gradient_checkpoint": true,
+        "image_size": 256,
+        "log_every": 5,
+        "log_gradients": true,
+        "log_ode_trajectory": true,
+        "loss_type": "l2",
+        "lr": 0.0001,
+        "mask_outside_value": -1.0,
+        "mask_pattern": "mask",
+        "mask_threshold": -0.7,
+        "masked_loss_ratio": 0.5,
+        "mixed_precision": "bf16",
+        "mlp_ratio": 4.0,
+        "mr_pattern": "mr.nii",
+        "num_bottleneck_blocks": 1,
+        "num_epochs": 300,
+        "num_heads": 8,
+        "num_res_blocks": 1,
+        "num_sample_steps": 40,
+        "num_sfb_blocks": 1,
+        "num_slices": 4,
+        "num_swin_blocks": 2,
+        "num_val_samples": 3,
+        "num_workers": 8,
+        "pfgmpp": true,
+        "radius_emb_dim": 256,
+        "rho": 7.0,
+        "sample_every": 1,
+        "save_every": 20,
+        "seed": 42,
+        "sigma_data": 0.45,
+        "sigma_max": 80.0,
+        "sigma_min": 0.002,
+        "slice_stride": 2,
+        "train_split": 0.9,
+        "tta_flips": [
+          "lr",
+          "ud",
+          "lr_ud"
+        ],
+        "use_body_mask": true,
+        "use_cfg_plus_plus": true,
+        "use_deformable_sfb": false,
+        "use_dynamic_cfg": true,
+        "use_ema": true,
+        "use_masked_loss": false,
+        "use_sfb": true,
+        "use_tta": false,
+        "val_every": 1,
+        "warmup_steps": 500,
+        "weight_decay": 0.01,
+        "window_size": 4,
+        "window_size_3d": {
+          "1": [
+            2,
+            4,
+            4
+          ],
+          "2": [
+            2,
+            4,
+            4
+          ],
+          "3": [
+            1,
+            4,
+            4
+          ]
+        }
+      },
+      "checkpoints": []
+    },
+    {
+      "run": "20260717_061350_pfgm_fir_25d",
+      "validation_sample_count": 109,
+      "at_best_psnr": {
+        "step": 90,
+        "epoch": 91,
+        "psnr": 30.178295135498047,
+        "ssim": 0.8654151558876038,
+        "mae": 0.019534669816493988,
+        "logged_comparison_available": true,
+        "exact_epoch_checkpoint": false
+      },
+      "best_ssim": {
+        "step": 53,
+        "epoch": 54,
+        "value": 0.8949537873268127
+      },
+      "best_mae": {
+        "step": 90,
+        "epoch": 91,
+        "value": 0.019534669816493988
+      },
+      "best_validation_loss": {
+        "step": 87,
+        "epoch": 88,
+        "value": 0.006710093002766371
+      },
+      "peak_allocated_gpu_mib": {
+        "step": 13,
+        "epoch": 14,
+        "value": 16722.056640625
+      },
+      "configuration": {
+        "D": 128,
+        "P_mean": -0.8,
+        "P_std": 1.0,
+        "S_churn": 20.0,
+        "S_max": "Infinity",
+        "S_min": 0.0,
+        "S_noise": 1.0,
+        "attention_resolutions": [
+          3,
+          4
+        ],
+        "attention_type": "deformable",
+        "base_channels": 64,
+        "batch_size": 5,
+        "cache_volumes": true,
+        "cfg_rescale_factor": 0.7,
+        "cfg_scale": 2.0,
+        "cfg_scale_max": 2.0,
+        "cfg_scale_min": 1.0,
+        "channel_mults": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "cond_drop_prob": 0.1,
+        "cond_drop_prob_end_epoch": 0,
+        "ct_pattern": "ct.nii",
+        "deformable_kwargs": {
+          "n_groups": 8,
+          "kv_stride": 1,
+          "offset_range_factor": 8.0,
+          "use_qk_norm": true
+        },
+        "deformable_sfb_kwargs": {
+          "kernel_size": [
+            1,
+            3,
+            3
+          ],
+          "offset_scale": 1.0,
+          "use_modulation": false,
+          "deformable_depth": false
+        },
+        "downsample_strides_3d": [
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            1,
+            2,
+            2
+          ]
+        ],
+        "drop_path": 0.05,
+        "dropout": 0.1,
+        "ema_decay": 0.9999,
+        "ema_update_every": 1,
+        "grad_clip": 1.0,
+        "grad_log_interval": 100,
+        "gradient_checkpoint": true,
+        "image_size": 256,
+        "log_every": 5,
+        "log_gradients": true,
+        "log_ode_trajectory": true,
+        "loss_type": "l2",
+        "lr": 0.0001,
+        "mask_outside_value": -1.0,
+        "mask_pattern": "mask",
+        "mask_threshold": -0.7,
+        "masked_loss_ratio": 0.5,
+        "mixed_precision": "bf16",
+        "mlp_ratio": 4.0,
+        "mr_pattern": "mr.nii",
+        "num_bottleneck_blocks": 1,
+        "num_epochs": 300,
+        "num_heads": 8,
+        "num_res_blocks": 1,
+        "num_sample_steps": 40,
+        "num_sfb_blocks": 1,
+        "num_slices": 8,
+        "num_swin_blocks": 2,
+        "num_val_samples": 3,
+        "num_workers": 8,
+        "pfgmpp": true,
+        "radius_emb_dim": 256,
+        "rho": 7.0,
+        "sample_every": 1,
+        "save_every": 20,
+        "seed": 42,
+        "sigma_data": 0.45,
+        "sigma_max": 80.0,
+        "sigma_min": 0.002,
+        "slice_stride": 4,
+        "train_split": 0.9,
+        "tta_flips": [
+          "lr",
+          "ud",
+          "lr_ud"
+        ],
+        "use_body_mask": true,
+        "use_cfg_plus_plus": true,
+        "use_deformable_sfb": false,
+        "use_dynamic_cfg": true,
+        "use_ema": true,
+        "use_masked_loss": false,
+        "use_sfb": true,
+        "use_tta": false,
+        "val_every": 1,
+        "warmup_steps": 500,
+        "weight_decay": 0.01,
+        "window_size": 4,
+        "window_size_3d": {
+          "1": [
+            2,
+            4,
+            4
+          ],
+          "2": [
+            2,
+            4,
+            4
+          ],
+          "3": [
+            1,
+            4,
+            4
+          ]
+        }
+      },
+      "checkpoints": [
+        "best",
+        "epoch_0020",
+        "epoch_0040",
+        "epoch_0060",
+        "epoch_0080",
+        "epoch_0100"
+      ]
+    },
+    {
+      "run": "20260720_051137_pfgm_fir_25d",
+      "validation_sample_count": 251,
+      "at_best_psnr": {
+        "step": 170,
+        "epoch": 171,
+        "psnr": 32.79357147216797,
+        "ssim": 0.9304399490356445,
+        "mae": 0.01493436936289072,
+        "logged_comparison_available": true,
+        "exact_epoch_checkpoint": false
+      },
+      "best_ssim": {
+        "step": 207,
+        "epoch": 208,
+        "value": 0.9307587742805481
+      },
+      "best_mae": {
+        "step": 229,
+        "epoch": 230,
+        "value": 0.013761280104517937
+      },
+      "best_validation_loss": {
+        "step": 238,
+        "epoch": 239,
+        "value": 0.006003900431096554
+      },
+      "peak_allocated_gpu_mib": {
+        "step": 53,
+        "epoch": 54,
+        "value": 16722.525390625
+      },
+      "configuration": {
+        "D": 128,
+        "P_mean": -0.8,
+        "P_std": 1.0,
+        "S_churn": 20.0,
+        "S_max": "Infinity",
+        "S_min": 0.0,
+        "S_noise": 1.0,
+        "attention_resolutions": [
+          3,
+          4
+        ],
+        "attention_type": "deformable",
+        "base_channels": 64,
+        "batch_size": 5,
+        "cache_volumes": true,
+        "cfg_rescale_factor": 0.7,
+        "cfg_scale": 2.0,
+        "cfg_scale_max": 2.0,
+        "cfg_scale_min": 1.0,
+        "channel_mults": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "cond_drop_prob": 0.1,
+        "cond_drop_prob_end_epoch": 0,
+        "ct_pattern": "ct.nii",
+        "deformable_kwargs": {
+          "n_groups": 8,
+          "kv_stride": 1,
+          "offset_range_factor": 8.0,
+          "use_qk_norm": true
+        },
+        "deformable_sfb_kwargs": {
+          "kernel_size": [
+            1,
+            3,
+            3
+          ],
+          "offset_scale": 1.0,
+          "use_modulation": false,
+          "deformable_depth": false
+        },
+        "downsample_strides_3d": [
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            2,
+            2,
+            2
+          ],
+          [
+            1,
+            2,
+            2
+          ]
+        ],
+        "drop_path": 0.05,
+        "dropout": 0.1,
+        "ema_decay": 0.9999,
+        "ema_update_every": 1,
+        "grad_clip": 1.0,
+        "grad_log_interval": 100,
+        "gradient_checkpoint": true,
+        "image_size": 256,
+        "log_every": 5,
+        "log_gradients": true,
+        "log_ode_trajectory": true,
+        "loss_type": "l2",
+        "lr": 0.0001,
+        "mask_outside_value": -1.0,
+        "mask_pattern": "mask",
+        "mask_threshold": -0.7,
+        "masked_loss_ratio": 0.5,
+        "mixed_precision": "bf16",
+        "mlp_ratio": 4.0,
+        "mr_pattern": "mr.nii",
+        "num_bottleneck_blocks": 1,
+        "num_epochs": 300,
+        "num_heads": 8,
+        "num_res_blocks": 1,
+        "num_sample_steps": 40,
+        "num_sfb_blocks": 1,
+        "num_slices": 8,
+        "num_swin_blocks": 2,
+        "num_val_samples": 3,
+        "num_workers": 8,
+        "pfgmpp": true,
+        "radius_emb_dim": 256,
+        "rho": 7.0,
+        "sample_every": 1,
+        "save_every": 20,
+        "seed": 42,
+        "sigma_data": 0.45,
+        "sigma_max": 80.0,
+        "sigma_min": 0.002,
+        "slice_stride": 4,
+        "train_split": 0.9,
+        "tta_flips": [
+          "lr",
+          "ud",
+          "lr_ud"
+        ],
+        "use_body_mask": true,
+        "use_cfg_plus_plus": true,
+        "use_deformable_sfb": false,
+        "use_dynamic_cfg": true,
+        "use_ema": true,
+        "use_masked_loss": false,
+        "use_sfb": true,
+        "use_tta": false,
+        "val_every": 1,
+        "warmup_steps": 500,
+        "weight_decay": 0.01,
+        "window_size": 4,
+        "window_size_3d": {
+          "1": [
+            2,
+            4,
+            4
+          ],
+          "2": [
+            2,
+            4,
+            4
+          ],
+          "3": [
+            1,
+            4,
+            4
+          ]
+        }
+      },
+      "checkpoints": [
+        "best",
+        "epoch_0020",
+        "epoch_0040",
+        "epoch_0060",
+        "epoch_0080",
+        "epoch_0100",
+        "epoch_0120",
+        "epoch_0140",
+        "epoch_0160",
+        "epoch_0180",
+        "epoch_0200",
+        "epoch_0220",
+        "epoch_0240"
+      ]
+    }
+  ]
+}

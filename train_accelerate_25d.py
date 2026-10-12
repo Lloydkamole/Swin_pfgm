@@ -20,18 +20,17 @@ Key differences from train_accelerate.py:
 
 Usage:
     # Single GPU:
-    python train_accelerate_25d.py
+    python train_accelerate_25d.py --data-dir /path/to/paired-data
     
     # Multi-GPU DDP (duplicates model on each GPU):
-    accelerate launch --num_processes 2 --gpu_ids 0,1 train_accelerate_25d.py
+    accelerate launch --multi_gpu --num_processes 2 --gpu_ids 0,1 train_accelerate_25d.py --data-dir /path/to/paired-data
     
-    # Multi-GPU FSDP (shards model across GPUs - RECOMMENDED):
-    accelerate launch --config_file accelerate_config_fsdp_25d.yaml train_accelerate_25d.py
-    
-    # Or with original FSDP config:
-    accelerate launch --config_file accelerate_config_fsdp.yaml train_accelerate_25d.py
+    # FSDP requires a separately configured, validated Accelerate environment.
 """
 
+import argparse
+import copy
+import json
 import gc
 import os
 import sys
@@ -158,7 +157,7 @@ class EMA:
 
 config = {
     # Data Settings
-    "data_dir": "/mnt/nvme/lloyd/DL project CT-MRI/pfgm_brain_train_n",
+    "data_dir": None,  # Set with --data-dir or a JSON configuration.
     "mr_pattern": "mr.nii",
     "ct_pattern": "ct.nii",
     "train_split": 0.9,
@@ -172,9 +171,7 @@ config = {
     "base_channels": 64,
     "channel_mults": [1, 2, 3, 4],  # 4 stages with 64, 128, 192, 256 channels
     "attention_resolutions": [3, 4],  # Attention when mult in [3,4] → stages 2,3
-    "num_res_blocks": 2,
-    "num_heads": 4,
-    "mlp_ratio": 4.0,
+    "num_res_blocks": 1,
     "radius_emb_dim": 256,
     "window_size": 4,  # Spatial window size (H, W) - fallback only
     # Multi-resolution window sizes per stage
@@ -183,8 +180,12 @@ config = {
         2: [2, 4, 4],   # Stage 2: 192 channels, attention enabled
         3: [1, 4, 4],   # Stage 3: 256 channels, attention enabled
     },
-    "dropout": 0.0,
-    "drop_path": 0.1,                    # Stochastic depth rate (matches 2D)
+    # Per-stage encoder downsampling strides as [D, H, W].
+    # For 4 stages, only the first 3 entries are used by encoder downsamples;
+    # the decoder mirrors them in reverse. Use [1, 2, 2] to preserve depth.
+    "downsample_strides_3d": [[2, 2, 2], [2, 2, 2], [2, 2, 2], [1, 2, 2]],
+    "dropout": 0.1,
+    "drop_path": 0.05,                    # Stochastic depth rate (matches 2D)
     "gradient_checkpoint": True,  # Trade ~30% speed for ~60% activation memory savings
 
     # SwinFIR / Attention architecture (mirrors 2D `train_accelerate.py`)
@@ -192,13 +193,20 @@ config = {
     "mlp_ratio": 4.0,
     "num_swin_blocks": 2,                # Attention blocks per FIRResBlock3D
     "num_sfb_blocks": 1,                 # 3D SFB blocks per FIRResBlock3D
-    "num_bottleneck_blocks": 2,          # FIRResBlock3D count in bottleneck
+    "num_bottleneck_blocks": 1,          # FIRResBlock3D count in bottleneck
     "use_sfb": True,                     # Enable 3D Spatial-Frequency Blocks
+    "use_deformable_sfb": False,         # Replace SFB3D spatial-branch convs with deformable convs
+    "deformable_sfb_kwargs": {
+        "kernel_size": [1, 3, 3],
+        "offset_scale": 1.0,
+        "use_modulation": False,
+        "deformable_depth": False,       # False = learn H/W offsets only
+    },
     "attention_type": "deformable",      # 'window' | 'deformable' (3D DAT++)
     "deformable_kwargs": {               # Forwarded to DeformableAttention3D
-        "n_groups": 4,
-        "kv_stride": 2,                  # Downsample only H,W (depth preserved)
-        "offset_range_factor": 4.0,
+        "n_groups": 8,
+        "kv_stride": 1,                  # Downsample only H,W (depth preserved)
+        "offset_range_factor": 8.0,
         "use_qk_norm": True,
     },
 
@@ -240,26 +248,26 @@ config = {
     
     # Body Mask Training (nnsyn-style anatomically-focused training)
     "use_body_mask": True,               # Enable body mask loading and masked training
-    "mask_pattern": "mask.nii",          # Suffix pattern to match mask files
+    "mask_pattern": "mask",          # Suffix pattern to match mask files
     "mask_outside_value": -1.0,          # Value for regions outside the mask
     
     # Training Parameters
-    "num_epochs": 100,
-    "batch_size": 8,  # Smaller batch size for 3D convolutions
+    "num_epochs": 300,
+    "batch_size": 5,  # Smaller batch size for 3D convolutions
     "lr": 1e-4,  # Matches 2D canonical
     "weight_decay": 0.01,
     "grad_clip": 1.0,  # Matches 2D canonical
     "warmup_steps": 500,  # Matches 2D canonical
     
     # Sampling / Generation
-    "num_sample_steps": 30,
+    "num_sample_steps": 40,
     "num_val_samples": 3,  # Fewer samples for visualization
     
     # Logging & Checkpointing
     "output_dir": "./outputs_accelerate_25d",
     "log_every": 5,
     "val_every": 1,
-    "save_every": 5,
+    "save_every": 20,
     "sample_every": 1,
     "resume": None,
     
@@ -271,6 +279,7 @@ config = {
     # System
     "seed": 42,
     "num_workers": 8,
+    "cache_volumes": True,
     "mixed_precision": "bf16",  # "no", "fp16", or "bf16" — bf16 halves memory usage
     
     # EMA (Exponential Moving Average)
@@ -288,8 +297,12 @@ config = {
 # Utility Functions
 # =============================================================================
 
+def _filename_matches(filename: str, pattern: str) -> bool:
+    return pattern.lower() in filename.lower()
+
+
 def collect_data_files(data_path: str, mr_pattern: str = "mr.nii", ct_pattern: str = "ct.nii",
-                       mask_pattern: str = "mask.nii", use_body_mask: bool = False):
+                       mask_pattern: str = "mask", use_body_mask: bool = False):
     """Collect MR, CT, and optionally mask file pairs from directory structure."""
     data_files = []
     if not os.path.exists(data_path):
@@ -304,11 +317,11 @@ def collect_data_files(data_path: str, mr_pattern: str = "mr.nii", ct_pattern: s
         ct_file = None
         mask_file = None
         for filename in os.listdir(patient_path):
-            if mr_pattern in filename:
+            if _filename_matches(filename, mr_pattern):
                 mr_file = os.path.join(patient_path, filename)
-            if ct_pattern in filename:
+            if _filename_matches(filename, ct_pattern):
                 ct_file = os.path.join(patient_path, filename)
-            if use_body_mask and mask_pattern in filename:
+            if use_body_mask and _filename_matches(filename, mask_pattern):
                 mask_file = os.path.join(patient_path, filename)
         
         if mr_file and ct_file:
@@ -959,55 +972,20 @@ def edm_sample(
 # Training Function
 # =============================================================================
 
-def train(cfg: dict):
-    """Main training function with Accelerate for 2.5D model."""
-
-    # Enable cuDNN autotuner for stable input shapes (mirrors 2D trainer).
-    torch.backends.cudnn.benchmark = True
-
-    # Create output directory
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(cfg["output_dir"]) / f"{timestamp}_pfgm_fir_25d"
-    
-    # Initialize Accelerator
-    project_config = ProjectConfiguration(
-        project_dir=str(output_dir),
-        logging_dir=str(output_dir / "logs"),
-    )
-    
-    accelerator = Accelerator(
-        mixed_precision=cfg["mixed_precision"],
-        gradient_accumulation_steps=1,
-        project_config=project_config,
-        log_with="tensorboard",
-    )
-    
-    # Set seed
-    set_seed(cfg["seed"])
-    
-    # Only main process prints
-    if accelerator.is_main_process:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        (output_dir / "checkpoints").mkdir(exist_ok=True)
-        
-        print(f"\n{'='*60}")
-        print(f"PFGM-FIR 2.5D Training with Accelerate")
-        print(f"{'='*60}")
-        print(f"Output directory: {output_dir}")
-        print(f"Number of processes: {accelerator.num_processes}")
-        print(f"Mixed precision: {cfg['mixed_precision']}")
-        print(f"Num slices: {cfg['num_slices']}")
-        print(f"PFGM++: {cfg.get('pfgmpp', False)}")
-        print(f"{'='*60}\n")
-    
-    # Build 2.5D model
+def build_model(cfg: dict):
+    """Construct the unchanged 2.5D architecture from a resolved configuration."""
     ws_3d = cfg["window_size_3d"]
     if isinstance(ws_3d, dict):
         ws_3d = {k: tuple(v) if isinstance(v, list) else v for k, v in ws_3d.items()}
     else:
         ws_3d = tuple(ws_3d) if isinstance(ws_3d, list) else ws_3d
-    
-    model = create_swin_fir_unet_25d(
+
+    downsample_strides_3d = [
+        tuple(s) if isinstance(s, list) else s
+        for s in cfg.get("downsample_strides_3d", [(2, 2, 2)] * (len(cfg["channel_mults"]) - 1))
+    ]
+
+    return create_swin_fir_unet_25d(
         in_channels=2,
         out_channels=1,
         num_slices=cfg["num_slices"],
@@ -1029,8 +1007,60 @@ def train(cfg: dict):
         gradient_checkpoint=cfg.get("gradient_checkpoint", False),
         attention_type=cfg.get("attention_type", "window"),
         deformable_kwargs=cfg.get("deformable_kwargs", None),
+        use_deformable_sfb=cfg.get("use_deformable_sfb", False),
+        deformable_sfb_kwargs=cfg.get("deformable_sfb_kwargs", None),
+        downsample_strides=downsample_strides_3d,
+    )
+
+
+
+def train(cfg: dict):
+    """Main training function with Accelerate for 2.5D model."""
+
+    # Enable cuDNN autotuner for stable input shapes (mirrors 2D trainer).
+    torch.backends.cudnn.benchmark = True
+
+    # Create output directory
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(cfg["output_dir"]) / f"{timestamp}_pfgm_fir_25d"
+    
+    # Initialize Accelerator
+    project_config = ProjectConfiguration(
+        project_dir=str(output_dir),
+        logging_dir=str(output_dir / "logs"),
     )
     
+    accelerator = Accelerator(
+        mixed_precision=cfg["mixed_precision"],
+        cpu=cfg.get("cpu", False),
+        gradient_accumulation_steps=1,
+        project_config=project_config,
+        log_with="tensorboard",
+    )
+    
+    # Set seed
+    set_seed(cfg["seed"])
+    
+    # Only main process prints
+    if accelerator.is_main_process:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "checkpoints").mkdir(exist_ok=True)
+        save_config(cfg, output_dir / "config.json")
+        
+        print(f"\n{'='*60}")
+        print(f"PFGM-FIR 2.5D Training with Accelerate")
+        print(f"{'='*60}")
+        print(f"Output directory: {output_dir}")
+        print(f"Number of processes: {accelerator.num_processes}")
+        print(f"Mixed precision: {cfg['mixed_precision']}")
+        print(f"Num slices: {cfg['num_slices']}")
+        print(f"PFGM++: {cfg.get('pfgmpp', False)}")
+        print(f"{'='*60}\n")
+    
+    # Build 2.5D model
+    model = build_model(cfg)
+    downsample_strides_3d = cfg.get("downsample_strides_3d")
+
     if accelerator.is_main_process:
         total_params = sum(p.numel() for p in model.parameters())
         print(f"Model parameters: {total_params/1e6:.2f}M")
@@ -1040,6 +1070,8 @@ def train(cfg: dict):
         print(f"    attention_resolutions: {cfg['attention_resolutions']}")
         print(f"    num_res_blocks: {cfg['num_res_blocks']}")
         print(f"    num_slices: {cfg['num_slices']}")
+        print(f"    downsample_strides_3d: {downsample_strides_3d}")
+        print(f"    use_deformable_sfb: {cfg.get('use_deformable_sfb', False)}")
         print(f"    gradient_checkpoint: {cfg.get('gradient_checkpoint', False)}")
         print(f"    mixed_precision: {cfg['mixed_precision']}")
     
@@ -1067,7 +1099,7 @@ def train(cfg: dict):
         print("Loading data files...")
     
     use_body_mask = cfg.get("use_body_mask", False)
-    mask_pattern = cfg.get("mask_pattern", "mask.nii")
+    mask_pattern = cfg.get("mask_pattern", "mask")
     
     all_files = collect_data_files(
         cfg["data_dir"],
@@ -1083,6 +1115,9 @@ def train(cfg: dict):
     val_files = all_files[split_idx:] if len(all_files) > split_idx else None
     
     if accelerator.is_main_process:
+        (output_dir / "split.json").write_text(json.dumps({
+            "train": train_files, "validation": val_files or [],
+        }, indent=2) + "\n")
         print(f"Found {len(train_files)} train, {len(val_files) if val_files else 0} val patients")
         if use_body_mask:
             print(f"Body mask training ENABLED - using mask pattern: {mask_pattern}")
@@ -1096,6 +1131,8 @@ def train(cfg: dict):
         num_slices=cfg["num_slices"],
         stride=cfg.get("slice_stride"),
         use_body_mask=use_body_mask,
+        cache_volumes=cfg.get("cache_volumes", True),
+        mode="train",
     )
     
     if accelerator.is_main_process:
@@ -1123,6 +1160,8 @@ def train(cfg: dict):
             num_slices=cfg["num_slices"],
             stride=cfg.get("slice_stride"),
             use_body_mask=use_body_mask,
+            cache_volumes=cfg.get("cache_volumes", True),
+            mode="val",
         )
         val_loader = DataLoader(
             val_dataset,
@@ -1660,5 +1699,69 @@ def train(cfg: dict):
         print(f"{'='*60}\n")
 
 
+def save_config(cfg, path):
+    """Write standard JSON, representing the unbounded sampler limit explicitly."""
+    serializable = copy.deepcopy(cfg)
+    if math.isinf(serializable.get("S_max", 0)):
+        serializable["S_max"] = "Infinity"
+    Path(path).write_text(json.dumps(serializable, indent=2, allow_nan=False) + "\n")
+
+
+def load_config(path=None):
+    """Load partial JSON overrides without mutating the historical defaults."""
+    cfg = copy.deepcopy(config)
+    if path is not None:
+        overrides = json.loads(Path(path).read_text())
+        unknown = set(overrides) - set(cfg) - {"cpu"}
+        if unknown:
+            raise ValueError(f"Unknown configuration keys: {sorted(unknown)}")
+        cfg.update(overrides)
+    if cfg.get("S_max") == "Infinity":
+        cfg["S_max"] = float("inf")
+    if isinstance(cfg["window_size_3d"], dict):
+        cfg["window_size_3d"] = {int(k): v for k, v in cfg["window_size_3d"].items()}
+    return cfg
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--config", type=Path, help="JSON overrides for the default configuration")
+    parser.add_argument("--data-dir", type=Path, help="Directory of paired, normalized NIfTI patient folders")
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--epochs", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--num-workers", type=int)
+    parser.add_argument("--cpu", action="store_true", help="CPU execution for small pipeline checks")
+    parser.add_argument("--print-config", action="store_true", help="Print resolved configuration and exit")
+    args = parser.parse_args()
+    cfg = load_config(args.config)
+    for name, key in [("data_dir", "data_dir"), ("output_dir", "output_dir"),
+                      ("epochs", "num_epochs"), ("batch_size", "batch_size"),
+                      ("num_workers", "num_workers")]:
+        value = getattr(args, name)
+        if value is not None:
+            cfg[key] = str(value) if isinstance(value, Path) else value
+    if args.cpu:
+        cfg["cpu"] = True
+        cfg["mixed_precision"] = "no"
+    if args.print_config:
+        printable = copy.deepcopy(cfg)
+        if math.isinf(printable["S_max"]):
+            printable["S_max"] = "Infinity"
+        print(json.dumps(printable, indent=2, allow_nan=False))
+        return
+    if not cfg["data_dir"]:
+        parser.error("provide --data-dir or data_dir in --config")
+    if not Path(cfg["data_dir"]).is_dir():
+        parser.error("data_dir must be an existing directory")
+    if cfg.get("resume"):
+        parser.error("checkpoint resume is not implemented; resume must be null")
+    if cfg["num_epochs"] < 1 or cfg["batch_size"] < 1 or cfg["num_workers"] < 0:
+        parser.error("epochs and batch size must be positive; workers must be nonnegative")
+    if cfg["num_slices"] < 2 or cfg["num_slices"] % 2:
+        parser.error("use an even num_slices of at least 2 for the current loader")
+    train(cfg)
+
+
 if __name__ == '__main__':
-    train(config)
+    main()

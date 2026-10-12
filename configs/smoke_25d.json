@@ -1,0 +1,45 @@
+{
+  "image_size": 32,
+  "base_channels": 8,
+  "channel_mults": [
+    1,
+    2
+  ],
+  "attention_resolutions": [
+    2
+  ],
+  "num_heads": 2,
+  "radius_emb_dim": 32,
+  "num_swin_blocks": 1,
+  "num_sfb_blocks": 1,
+  "num_bottleneck_blocks": 1,
+  "downsample_strides_3d": [
+    [
+      1,
+      2,
+      2
+    ]
+  ],
+  "window_size_3d": [
+    2,
+    4,
+    4
+  ],
+  "deformable_kwargs": {
+    "n_groups": 2,
+    "kv_stride": 2,
+    "offset_range_factor": 8.0,
+    "use_qk_norm": true
+  },
+  "num_epochs": 1,
+  "batch_size": 1,
+  "num_workers": 0,
+  "num_val_samples": 1,
+  "num_sample_steps": 2,
+  "warmup_steps": 1,
+  "log_gradients": false,
+  "log_ode_trajectory": false,
+  "gradient_checkpoint": false,
+  "mixed_precision": "no",
+  "cpu": true
+}

@@ -1,156 +1,83 @@
-# =============================================================================
-# Training outputs (generated at runtime — never commit)
-# =============================================================================
-/outputs/
-/outputs_accelerate/
-/outputs_accelerate_v2/
-/outputs_accelerate_medsam/
-/outputs_mp_accelerate/
-/outputs_accelerate_25d/
-/inference_output/
-/divers/
-/evaluation_results/
-/docs/
+# Public surface: 2.5D training, patch inference, examples and documentation.
+# Other files remain local. Ignoring a file does not remove it from Git history.
+/*
+!/.gitignore
+!/README.md
+!/ATTRIBUTION.md
+!/requirements.txt
+!/LICENSE
+!/NOTICE
+!/train_accelerate_25d.py
+!/loader_25d.py
+!/inference_25d.py
 
-# =============================================================================
-# Python artefacts
-# =============================================================================
-*.py[cod]
-*.so
-*.egg-info/
+!/models/
+/models/*
+!/models/__init__.py
+!/models/network_25d.py
+!/models/embeddings.py
+!/models/swin_attention.py
+!/models/swin_attention_3d.py
+!/models/deformable_attention_3d.py
+
+!/configs/
+/configs/*
+!/configs/train_25d.json
+!/configs/smoke_25d.json
+!/configs/showcase_25d.json
+
+!/examples/
+/examples/*
+!/examples/__init__.py
+!/examples/synthetic_demo.py
+!/examples/README.md
+!/examples/assets/
+/examples/assets/*
+!/examples/assets/synthetic_pipeline.png
+
+!/tools/
+/tools/*
+!/tools/__init__.py
+!/tools/summarize_runs_25d.py
+!/tools/check_25d.py
+
+!/docs/
+/docs/*
+!/docs/results.md
+!/docs/run_summary.json
+!/docs/run_scores.csv
+!/docs/repository_audit.md
+!/docs/validation.md
+!/docs/showcase_provenance.json
+!/docs/assets/
+/docs/assets/*
+!/docs/assets/run_comparison.png
+!/docs/assets/synthrad_validation.png
+
+# Defense in depth for data, secrets, checkpoints and generated files.
 __pycache__/
-venv/
-env/
-ENV/
+*.py[cod]
+*.bak
 .env
 .env.*
-
-# =============================================================================
-# Jupyter
-# =============================================================================
-.ipynb_checkpoints/
-
-# Exploratory / analysis notebooks (not needed to run training)
-sampling_steps_analysis.ipynb
-visualize_attention.ipynb
-visualize_deformable_attention.ipynb
-visualize_loader.ipynb
-
-# =============================================================================
-# IDEs & OS
-# =============================================================================
-.vscode/
-.DS_Store
-
-# =============================================================================
-# Diagnostic & profiling scripts (not needed to run training)
-# =============================================================================
-check_fsdp_status.py
-diagnose_training_25d.py
-profile_compile.py
-profile_gradckpt.py
-profile_training.py
-test_pfgmpp.py
-
-# Diagnostic output files
-diagnostic_full.txt
-diagnostic_output.txt
-
-# =============================================================================
-# Figure-generation scripts (regenerate with generate_*.py if needed)
-# =============================================================================
-generate_architecture_diagram.py
-generate_pipeline_figure.py
-generate_pipeline_pptx.py
-generate_pipeline_v2.py
-generate_presentation.py
-generate_swin_fir_slides.py
-generate_timeline.py
-
-# =============================================================================
-# Generated figures, slides & presentations
-# =============================================================================
-figure_*.pdf
-figure_*.png
-figure_*.pptx
-metrics_vs_steps.png
-quality_vs_time.png
-qualifying_exam_presentation.pptx
-
-# =============================================================================
-# Research writing / LaTeX (not part of the codebase)
-# =============================================================================
-research_strat.md
-rstrategy.tex
-traincan.tex
-
-# =============================================================================
-# Old / backup trainer scripts (superseded by the three canonical trainers)
-# =============================================================================
-train_accelerate_25d_backup.py
-train_accelerate_v2.py
-train_lightning_fsdp.py
-train_mp_accelerate.py
-train_pfgm_fir.py
-*.bak
-
-# =============================================================================
-# Old / unused model files (only imported by the old trainers above)
-# =============================================================================
-models/fir_blocks_v2.py
-models/mp_fir_blocks.py
-models/mp_layers.py
-models/mp_network.py
-models/network_v2.py
-
-# =============================================================================
-# Old loader (superseded by loader.py / loader_medsam.py / loader_25d.py)
-# =============================================================================
-loader2.py
-
-# =============================================================================
-# Model checkpoints & weights (never commit — too large)
-# =============================================================================
+*.pem
+*.key
+*.nii
+*.nii.gz
+*.dcm
+*.mha
+*.mhd
 *.pt
 *.pth
 *.ckpt
 *.safetensors
 *.bin
-*.onnx
-
-# =============================================================================
-# Medical-imaging / tensor data (huge — datasets live outside the repo)
-# =============================================================================
-*.nii
-*.nii.gz
-*.mha
-*.mhd
-*.dcm
+*.pkl
 *.npy
 *.npz
 *.h5
 *.hdf5
-
-# =============================================================================
-# Training logs & experiment tracking
-# =============================================================================
-*.log
-wandb/
-runs/
-lightning_logs/
-tb_logs/
-tensorboard/
-mlruns/
-
-# =============================================================================
-# Test / lint / type-check caches
-# =============================================================================
+events.out.tfevents.*
+.ipynb_checkpoints/
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-.coverage.*
-htmlcov/
-.tox/
-
-
+*.egg-info/

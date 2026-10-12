@@ -16,7 +16,7 @@ the body mask through deformable attention to suppress background K/V.
 """
 
 import math
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -134,15 +134,192 @@ class SpectralTransform3D(nn.Module):
         return out
 
 
+class DeformableConv3d(nn.Module):
+    """
+    Lightweight pure-PyTorch deformable 3D convolution.
+
+    Offsets are predicted in voxel units and zero-initialized. By default only
+    H/W offsets are deformable, while the kernel can still span depth.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: Union[int, Tuple[int, int, int]] = 3,
+        offset_scale: float = 1.0,
+        use_modulation: bool = False,
+        deformable_depth: bool = False,
+        bias: bool = True,
+    ):
+        super().__init__()
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size, kernel_size)
+        else:
+            kernel_size = tuple(kernel_size)
+        if any(k % 2 == 0 for k in kernel_size):
+            raise ValueError("DeformableConv3d expects odd kernel sizes.")
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.padding = tuple(k // 2 for k in kernel_size)
+        self.offset_scale = float(offset_scale)
+        self.use_modulation = bool(use_modulation)
+        self.deformable_depth = bool(deformable_depth)
+        self.kernel_points = kernel_size[0] * kernel_size[1] * kernel_size[2]
+        self.offset_dims = 3 if self.deformable_depth else 2
+
+        offset_channels = self.offset_dims * self.kernel_points
+        if self.use_modulation:
+            offset_channels += self.kernel_points
+        self.offset_net = nn.Conv3d(
+            in_channels,
+            offset_channels,
+            kernel_size=3,
+            padding=1,
+        )
+        self.offset_net._skip_reinit = True
+
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels, self.kernel_points)
+        )
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_channels))
+        else:
+            self.register_parameter('bias', None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_normal_(self.weight, mode='fan_out', nonlinearity='relu')
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+        nn.init.zeros_(self.offset_net.weight)
+        nn.init.zeros_(self.offset_net.bias)
+        if self.use_modulation:
+            with torch.no_grad():
+                start = self.offset_dims * self.kernel_points
+                self.offset_net.bias[start:].fill_(2.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        B, C, D, H, W = x.shape
+        kd, kh, kw = self.kernel_size
+        pd, ph, pw = self.padding
+
+        offset_mod = self.offset_net(x).float()
+        offset_channels = self.offset_dims * self.kernel_points
+        offsets = offset_mod[:, :offset_channels]
+        offsets = offsets.view(B, self.kernel_points, self.offset_dims, D, H, W)
+        offsets = offsets * self.offset_scale
+
+        modulation = None
+        if self.use_modulation:
+            modulation = offset_mod[:, offset_channels:]
+            modulation = torch.sigmoid(modulation.view(B, self.kernel_points, D, H, W))
+
+        work_x = x.float()
+        device = x.device
+        z_base, y_base, x_base = torch.meshgrid(
+            torch.arange(D, device=device, dtype=torch.float32),
+            torch.arange(H, device=device, dtype=torch.float32),
+            torch.arange(W, device=device, dtype=torch.float32),
+            indexing='ij',
+        )
+        z_base = z_base.unsqueeze(0)
+        y_base = y_base.unsqueeze(0)
+        x_base = x_base.unsqueeze(0)
+
+        kernel_z, kernel_y, kernel_x = torch.meshgrid(
+            torch.arange(kd, device=device, dtype=torch.float32) - pd,
+            torch.arange(kh, device=device, dtype=torch.float32) - ph,
+            torch.arange(kw, device=device, dtype=torch.float32) - pw,
+            indexing='ij',
+        )
+        kernel_z = kernel_z.reshape(-1)
+        kernel_y = kernel_y.reshape(-1)
+        kernel_x = kernel_x.reshape(-1)
+
+        sampled = []
+        denom_z = max(D - 1, 1)
+        denom_y = max(H - 1, 1)
+        denom_x = max(W - 1, 1)
+        for k in range(self.kernel_points):
+            if self.deformable_depth:
+                off_z = offsets[:, k, 0]
+                off_y = offsets[:, k, 1]
+                off_x = offsets[:, k, 2]
+            else:
+                off_y = offsets[:, k, 0]
+                off_x = offsets[:, k, 1]
+                off_z = torch.zeros_like(off_y)
+
+            z = z_base + kernel_z[k] + off_z
+            y = y_base + kernel_y[k] + off_y
+            x_coord = x_base + kernel_x[k] + off_x
+            valid = (
+                (z >= 0) & (z <= D - 1) &
+                (y >= 0) & (y <= H - 1) &
+                (x_coord >= 0) & (x_coord <= W - 1)
+            ).unsqueeze(1).to(work_x.dtype)
+            grid = torch.stack(
+                (
+                    2.0 * x_coord / denom_x - 1.0,
+                    2.0 * y / denom_y - 1.0,
+                    2.0 * z / denom_z - 1.0,
+                ),
+                dim=-1,
+            )
+            sample = F.grid_sample(
+                work_x,
+                grid,
+                mode='bilinear',
+                padding_mode='zeros',
+                align_corners=True,
+            )
+            sample = sample * valid
+            if modulation is not None:
+                sample = sample * modulation[:, k].unsqueeze(1)
+            sampled.append(sample)
+
+        sampled = torch.stack(sampled, dim=2)  # [B, C, K, D, H, W]
+        out = torch.einsum('ock,bckdhw->bodhw', self.weight.float(), sampled)
+        if self.bias is not None:
+            out = out + self.bias.float().view(1, -1, 1, 1, 1)
+        return out.to(input_dtype)
+
+
 class ResB3D(nn.Module):
     """Simple 3D residual block (spatial branch of SFB3D)."""
 
-    def __init__(self, embed_dim: int, reduction: int = 1):
+    def __init__(
+        self,
+        embed_dim: int,
+        reduction: int = 1,
+        use_deformable: bool = False,
+        deformable_kwargs: Optional[dict] = None,
+    ):
         super().__init__()
+        hidden_dim = embed_dim // reduction
+        if use_deformable:
+            deformable_kwargs = dict(deformable_kwargs or {})
+            conv = lambda in_ch, out_ch: DeformableConv3d(  # noqa: E731
+                in_ch,
+                out_ch,
+                **deformable_kwargs,
+            )
+        else:
+            conv = lambda in_ch, out_ch: nn.Conv3d(  # noqa: E731
+                in_ch,
+                out_ch,
+                kernel_size=3,
+                padding=1,
+            )
         self.body = nn.Sequential(
-            nn.Conv3d(embed_dim, embed_dim // reduction, kernel_size=3, padding=1),
+            conv(embed_dim, hidden_dim),
             nn.LeakyReLU(negative_slope=0.2, inplace=True),
-            nn.Conv3d(embed_dim // reduction, embed_dim, kernel_size=3, padding=1),
+            conv(hidden_dim, embed_dim),
         )
         self.scale = 1.0 / math.sqrt(2)
 
@@ -153,9 +330,20 @@ class ResB3D(nn.Module):
 class SFB3D(nn.Module):
     """3D Spatial-Frequency Block: local conv branch + global FFT branch fused."""
 
-    def __init__(self, embed_dim: int, reduction: int = 1):
+    def __init__(
+        self,
+        embed_dim: int,
+        reduction: int = 1,
+        use_deformable: bool = False,
+        deformable_kwargs: Optional[dict] = None,
+    ):
         super().__init__()
-        self.S = ResB3D(embed_dim, reduction)
+        self.S = ResB3D(
+            embed_dim,
+            reduction,
+            use_deformable=use_deformable,
+            deformable_kwargs=deformable_kwargs,
+        )
         self.F = SpectralTransform3D(embed_dim)
         self.norm = LayerNorm3d(embed_dim * 2)
         self.fusion = nn.Conv3d(embed_dim * 2, embed_dim, kernel_size=1)
@@ -201,6 +389,8 @@ class FIRResBlock3D(nn.Module):
         gradient_checkpoint: bool = False,
         attention_type: str = 'window',
         deformable_kwargs: Optional[dict] = None,
+        use_deformable_sfb: bool = False,
+        deformable_sfb_kwargs: Optional[dict] = None,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -211,6 +401,7 @@ class FIRResBlock3D(nn.Module):
         self.num_sfb_blocks = num_sfb_blocks
         self.use_gradient_checkpoint = gradient_checkpoint
         self.attention_type = attention_type
+        self.use_deformable_sfb = use_deformable_sfb
 
         # === Stage 1: AdaGN3D + Conv (radius FiLM conditioning) ===
         self.adagn = AdaGroupNorm3D(in_channels, radius_emb_dim)
@@ -258,7 +449,12 @@ class FIRResBlock3D(nn.Module):
         # === Stage 3: SFB3D blocks ===
         if use_sfb and num_sfb_blocks > 0:
             self.sfb_blocks = nn.ModuleList([
-                SFB3D(out_channels) for _ in range(num_sfb_blocks)
+                SFB3D(
+                    out_channels,
+                    use_deformable=use_deformable_sfb,
+                    deformable_kwargs=deformable_sfb_kwargs,
+                )
+                for _ in range(num_sfb_blocks)
             ])
         else:
             self.sfb_blocks = None
@@ -355,22 +551,29 @@ class FIRResBlock3D(nn.Module):
 # =============================================================================
 
 class Downsample3D(nn.Module):
-    """3D downsampling via strided conv on all (D, H, W) dims."""
+    """3D downsampling via strided conv with configurable (D, H, W) stride."""
 
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, stride: Tuple[int, int, int] = (2, 2, 2)):
         super().__init__()
-        self.conv = nn.Conv3d(channels, channels, kernel_size=3, stride=2, padding=1)
+        self.stride = tuple(stride)
+        self.conv = nn.Conv3d(channels, channels, kernel_size=3, stride=self.stride, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
 
 
 class Upsample3D(nn.Module):
-    """3D upsampling via transpose conv on all (D, H, W) dims."""
+    """3D upsampling via transpose conv with configurable (D, H, W) stride."""
 
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, stride: Tuple[int, int, int] = (2, 2, 2)):
         super().__init__()
-        self.conv = nn.ConvTranspose3d(channels, channels, kernel_size=2, stride=2)
+        self.stride = tuple(stride)
+        self.conv = nn.ConvTranspose3d(
+            channels,
+            channels,
+            kernel_size=self.stride,
+            stride=self.stride,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
@@ -409,6 +612,9 @@ class SwinFIRUNet25D(nn.Module):
         gradient_checkpoint: bool = False,
         attention_type: str = 'window',
         deformable_kwargs: Optional[dict] = None,
+        use_deformable_sfb: bool = False,
+        deformable_sfb_kwargs: Optional[dict] = None,
+        downsample_strides: Optional[List[Tuple[int, int, int]]] = None,
     ):
         super().__init__()
 
@@ -424,6 +630,8 @@ class SwinFIRUNet25D(nn.Module):
         self.gradient_checkpoint = gradient_checkpoint
         self.attention_type = attention_type
         self.deformable_kwargs = deformable_kwargs or {}
+        self.use_deformable_sfb = use_deformable_sfb
+        self.deformable_sfb_kwargs = deformable_sfb_kwargs or {}
         # When in_channels==3, body mask is concatenated as 3rd input channel.
         self.use_mask_channel = (in_channels == 3)
 
@@ -432,6 +640,19 @@ class SwinFIRUNet25D(nn.Module):
             self.window_size_3d = {i: tuple(window_size_3d) for i in range(len(channel_mults))}
         else:
             self.window_size_3d = window_size_3d
+
+        if downsample_strides is None:
+            downsample_strides = [(2, 2, 2)] * max(len(channel_mults) - 1, 0)
+        downsample_strides = [
+            tuple(s) if isinstance(s, (tuple, list)) else (s, s, s)
+            for s in downsample_strides
+        ]
+        if len(downsample_strides) < len(channel_mults) - 1:
+            raise ValueError(
+                "downsample_strides must provide at least one stride per encoder "
+                f"downsample ({len(channel_mults) - 1} needed, got {len(downsample_strides)})"
+            )
+        self.downsample_strides = downsample_strides[:max(len(channel_mults) - 1, 0)]
 
         # Stochastic depth schedule
         num_stages = len(channel_mults)
@@ -474,6 +695,8 @@ class SwinFIRUNet25D(nn.Module):
                         gradient_checkpoint=gradient_checkpoint,
                         attention_type=attention_type,
                         deformable_kwargs=self.deformable_kwargs,
+                        use_deformable_sfb=self.use_deformable_sfb,
+                        deformable_sfb_kwargs=self.deformable_sfb_kwargs,
                     )
                 )
                 current_channels = out_ch
@@ -481,7 +704,9 @@ class SwinFIRUNet25D(nn.Module):
             self.encoder_stages.append(stage_blocks)
 
             if i < num_stages - 1:
-                self.downsamples.append(Downsample3D(current_channels))
+                self.downsamples.append(
+                    Downsample3D(current_channels, stride=self.downsample_strides[i])
+                )
 
         # === Bottleneck ===
         bottleneck_ws = self.window_size_3d.get(num_stages - 1, (2, 8, 8))
@@ -502,6 +727,8 @@ class SwinFIRUNet25D(nn.Module):
                 gradient_checkpoint=gradient_checkpoint,
                 attention_type=attention_type,
                 deformable_kwargs=self.deformable_kwargs,
+                use_deformable_sfb=self.use_deformable_sfb,
+                deformable_sfb_kwargs=self.deformable_sfb_kwargs,
             )
             for _ in range(num_bottleneck_blocks)
         ])
@@ -522,7 +749,8 @@ class SwinFIRUNet25D(nn.Module):
                 skip_in_ch = current_channels
             else:
                 # Upsample from current_channels to out_ch via ConvTranspose
-                self.upsamples.append(Upsample3D(current_channels))
+                upsample_stride = self.downsample_strides[-idx]
+                self.upsamples.append(Upsample3D(current_channels, stride=upsample_stride))
                 skip_in_ch = current_channels + out_ch  # cat with skip
 
             self.skip_convs.append(nn.Conv3d(skip_in_ch, out_ch, kernel_size=1))
@@ -546,6 +774,8 @@ class SwinFIRUNet25D(nn.Module):
                         gradient_checkpoint=gradient_checkpoint,
                         attention_type=attention_type,
                         deformable_kwargs=self.deformable_kwargs,
+                        use_deformable_sfb=self.use_deformable_sfb,
+                        deformable_sfb_kwargs=self.deformable_sfb_kwargs,
                     )
                 )
                 block_idx += 1
@@ -655,6 +885,9 @@ def create_swin_fir_unet_25d(
     gradient_checkpoint: bool = False,
     attention_type: str = 'window',
     deformable_kwargs: Optional[dict] = None,
+    use_deformable_sfb: bool = False,
+    deformable_sfb_kwargs: Optional[dict] = None,
+    downsample_strides: Optional[List[Tuple[int, int, int]]] = None,
 ) -> SwinFIRUNet25D:
     """Factory for 2.5D SwinFIR UNet — matches `create_swin_fir_unet` 2D API."""
     return SwinFIRUNet25D(
@@ -679,4 +912,7 @@ def create_swin_fir_unet_25d(
         gradient_checkpoint=gradient_checkpoint,
         attention_type=attention_type,
         deformable_kwargs=deformable_kwargs,
+        use_deformable_sfb=use_deformable_sfb,
+        deformable_sfb_kwargs=deformable_sfb_kwargs,
+        downsample_strides=downsample_strides,
     )

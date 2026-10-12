@@ -396,32 +396,25 @@ class SwinTransformerBlock3D(nn.Module):
         B, L, C = x.shape
         assert L == D * H * W, f"Input size mismatch: {L} != {D}*{H}*{W}"
         
-        # Check if dimensions are divisible by window size
         Wd, Wh, Ww = self.window_size
-        if D % Wd != 0 or H % Wh != 0 or W % Ww != 0:
-            # Dimensions not divisible - crop to nearest multiple
-            D_working = (D // Wd) * Wd
-            H_working = (H // Wh) * Wh
-            W_working = (W // Ww) * Ww
-            
-            if D_working == 0 or H_working == 0 or W_working == 0:
-                # Window too large, skip attention
-                return x
-            
-            # Extract working region
-            x_view = x.view(B, D, H, W, C)
-            x_crop = x_view[:, :D_working, :H_working, :W_working, :].contiguous()
-            x_crop_flat = x_crop.view(B, D_working * H_working * W_working, C)
-            
-            # Process cropped region
-            shortcut_crop = x_crop_flat
-            x_proc = self.norm1(x_crop_flat)
-            x_proc = x_proc.view(B, D_working, H_working, W_working, C)
-        else:
-            D_working, H_working, W_working = D, H, W
-            shortcut = x
-            x_proc = self.norm1(x)
-            x_proc = x_proc.view(B, D, H, W, C)
+        pad_d = (Wd - D % Wd) % Wd
+        pad_h = (Wh - H % Wh) % Wh
+        pad_w = (Ww - W % Ww) % Ww
+        D_working = D + pad_d
+        H_working = H + pad_h
+        W_working = W + pad_w
+        needs_pad = pad_d > 0 or pad_h > 0 or pad_w > 0
+
+        # Pad instead of cropping/skipping. Cropping can make D_working=0 when
+        # depth is smaller than Wd (common in 2.5D after downsampling), which
+        # bypasses the block and leaves DDP parameters unused.
+        x_view = x.view(B, D, H, W, C)
+        x_proc = self.norm1(x).view(B, D, H, W, C)
+        if needs_pad:
+            pad = (0, 0, 0, pad_w, 0, pad_h, 0, pad_d)
+            x_view = F.pad(x_view, pad, mode='constant', value=0)
+            x_proc = F.pad(x_proc, pad, mode='constant', value=0)
+        shortcut = x_view.contiguous().view(B, D_working * H_working * W_working, C)
         
         # Cyclic shift for SW-MSA
         if any(s > 0 for s in self.shift_size):
@@ -455,17 +448,12 @@ class SwinTransformerBlock3D(nn.Module):
         x_proc = x_proc.view(B, D_working * H_working * W_working, C)
         
         # Residual connection + MLP
-        if D_working != D or H_working != H or W_working != W:
-            # We cropped - only process cropped region
-            x_proc = shortcut_crop + self.drop_path(x_proc)
-            x_proc = x_proc + self.drop_path(self.mlp(self.norm2(x_proc)))
-            
-            # Paste back into original size
-            x_view = x.view(B, D, H, W, C).clone()
-            x_proc_view = x_proc.view(B, D_working, H_working, W_working, C)
-            x_view[:, :D_working, :H_working, :W_working, :] = x_proc_view
-            return x_view.view(B, D * H * W, C)
-        else:
-            x_proc = shortcut + self.drop_path(x_proc)
-            x_proc = x_proc + self.drop_path(self.mlp(self.norm2(x_proc)))
-            return x_proc
+        x_proc = shortcut + self.drop_path(x_proc)
+        x_proc = x_proc + self.drop_path(self.mlp(self.norm2(x_proc)))
+
+        if needs_pad:
+            x_proc = x_proc.view(B, D_working, H_working, W_working, C)
+            x_proc = x_proc[:, :D, :H, :W, :].contiguous()
+            return x_proc.view(B, D * H * W, C)
+
+        return x_proc
