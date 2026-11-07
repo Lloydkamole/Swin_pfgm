@@ -3,7 +3,7 @@
 
 Loads small volumetric patches (e.g., 5 consecutive slices) from 3D NIfTI volumes.
 Uses fixed stride sampling without padding - some edge slices will be skipped.
-In-plane patches are center cropped during both training and validation.
+In-plane patches are randomly cropped during training and center cropped in validation.
 Smaller in-plane dimensions are center padded; no resizing is performed.
 
 Returns:
@@ -115,7 +115,7 @@ class SpatialCropError(ValueError):
 
 
 def _crop_in_plane(sample, target_size, mode):
-    """Center crop/pad aligned [C, D, H, W] tensors without changing depth.
+    """Random train / centered validation crop with centered padding, preserving depth.
 
     Intensities are already normalized to [-1, 1]: pad images with -1 and
     masks with 0. Odd extra pixels go on the high-index side of each axis.
@@ -125,8 +125,12 @@ def _crop_in_plane(sample, target_size, mode):
            for volume in sample.values()):
         raise SpatialCropError("MRI, CT and mask must have matching depth and in-plane shapes.")
     height, width = shape[-2:]
-    top = max(0, (height - target_size) // 2)
-    left = max(0, (width - target_size) // 2)
+    if mode == "train":
+        top = torch.randint(height - target_size + 1, ()).item() if height > target_size else 0
+        left = torch.randint(width - target_size + 1, ()).item() if width > target_size else 0
+    else:
+        top = max(0, (height - target_size) // 2)
+        left = max(0, (width - target_size) // 2)
     pad_h = max(0, target_size - height)
     pad_w = max(0, target_size - width)
     padding = (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2)
@@ -150,7 +154,7 @@ class MonaiNifti25DDataset(Dataset):
     Args:
         data (list of dict): List where each dict contains 'mr' and 'ct' file paths.
         transform (callable): MONAI Compose object for 3D volume transforms.
-        target_size (int): In-plane center crop/pad size (H, W), without interpolation.
+        target_size (int): In-plane crop/pad size (H, W), without interpolation.
         num_slices (int): Number of consecutive slices to sample (depth dimension).
         stride (int): Stride between volume centers. If None, defaults to num_slices (non-overlapping).
     """

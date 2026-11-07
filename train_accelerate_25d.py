@@ -190,7 +190,7 @@ config = {
     "ct_pattern": "ct.nii",
     "train_split": 0.9,
     "split_group_manifests": {},  # Optional data-root -> patient,split_group CSV overrides.
-    "image_size": 256,  # Centered H/W crop/pad for train and val; no interpolation.
+    "image_size": 256,  # Random train / centered val H/W crop; centered padding, no interpolation.
     
     # 2.5D Settings
     "num_slices": 4,           # Number of consecutive slices (divisible by 2 for attention)
@@ -299,6 +299,7 @@ config = {
     "save_every": 20,
     "sample_every": 1,
     "resume": None,
+    "max_train_steps": None,  # Optional hard limit for short startup checks.
     
     # Gradient & ODE Monitoring
     "log_gradients": True,
@@ -1434,6 +1435,8 @@ def train(cfg: dict):
                     }, step=global_step)
             
             global_step += 1
+            if cfg.get("max_train_steps") is not None and global_step >= cfg["max_train_steps"]:
+                break
         
         # =====================================================================
         # Epoch stats
@@ -1454,6 +1457,11 @@ def train(cfg: dict):
         
         if accelerator.is_main_process:
             print(f"\nEpoch {epoch+1}: avg_loss={avg_loss:.3e}, time={epoch_time:.1f}s")
+
+        if cfg.get("max_train_steps") is not None and global_step >= cfg["max_train_steps"]:
+            if accelerator.is_main_process:
+                print(f"Reached max_train_steps={cfg['max_train_steps']}; stopping before generation/validation.")
+            break
         
         # =====================================================================
         # Sample generation (visualize center slice)
@@ -1750,7 +1758,7 @@ def train(cfg: dict):
     
     # Final save
     save_training_checkpoint(accelerator, model, ema, output_dir / "checkpoints" / "final",
-                             cfg["num_epochs"], global_step)
+                             epoch + 1, global_step)
     accelerator.end_training()
     
     if accelerator.is_main_process:
@@ -1793,13 +1801,14 @@ def main():
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--num-workers", type=int)
+    parser.add_argument("--max-steps", type=int, help="Stop after this many optimizer steps (startup check)")
     parser.add_argument("--cpu", action="store_true", help="CPU execution for small pipeline checks")
     parser.add_argument("--print-config", action="store_true", help="Print resolved configuration and exit")
     args = parser.parse_args()
     cfg = load_config(args.config)
     for name, key in [("data_dir", "data_dir"), ("output_dir", "output_dir"),
                       ("epochs", "num_epochs"), ("batch_size", "batch_size"),
-                      ("num_workers", "num_workers")]:
+                      ("num_workers", "num_workers"), ("max_steps", "max_train_steps")]:
         value = getattr(args, name)
         if value is not None:
             if name == "data_dir":
@@ -1826,6 +1835,11 @@ def main():
         parser.error("epochs and batch size must be positive; workers must be nonnegative")
     if cfg["num_val_samples"] < 1:
         parser.error("num_val_samples must be positive")
+    if cfg.get("max_train_steps") is not None and (
+        not isinstance(cfg["max_train_steps"], int) or isinstance(cfg["max_train_steps"], bool)
+        or cfg["max_train_steps"] < 1
+    ):
+        parser.error("max_train_steps / --max-steps must be a positive integer")
     if cfg["num_slices"] < 2 or cfg["num_slices"] % 2:
         parser.error("use an even num_slices of at least 2 for the current loader")
     train(cfg)
