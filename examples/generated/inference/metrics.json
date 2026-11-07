@@ -1,0 +1,18 @@
+{
+  "seed": 42,
+  "patch_index": 0,
+  "shape": [
+    1,
+    1,
+    4,
+    32,
+    32
+  ],
+  "background": "-1 outside the supplied body mask; 0 after mapping to [0, 1]",
+  "weight_type": "raw checkpoint weights; EMA weights not restored",
+  "metrics": {
+    "psnr": 8.740128517150879,
+    "ssim": 0.14292673766613007,
+    "mae": 0.4985952377319336
+  }
+}

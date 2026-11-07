@@ -1,0 +1,17 @@
+{
+  "status": "failed",
+  "watcher_pid": 3289751,
+  "command": [
+    "/mnt/nvme/lloyd/anaconda3/envs/edm/bin/accelerate",
+    "launch",
+    "--multi_gpu",
+    "--num_processes",
+    "2",
+    "--gpu_ids",
+    "0,1",
+    "train_accelerate_25d.py"
+  ],
+  "updated_at": "2026-10-28T07:38:03.911759-07:00",
+  "training_pid": 3355069,
+  "exit_code": 1
+}

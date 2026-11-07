@@ -3,6 +3,8 @@
 
 Loads small volumetric patches (e.g., 5 consecutive slices) from 3D NIfTI volumes.
 Uses fixed stride sampling without padding - some edge slices will be skipped.
+In-plane patches are center cropped during both training and validation.
+Smaller in-plane dimensions are center padded; no resizing is performed.
 
 Returns:
     - MRI volume: [B, 1, D, H, W] where D=num_slices (e.g., 5)
@@ -108,6 +110,36 @@ def _get_aug_transforms_25d(mode="train", use_body_mask=False):
     return _augment
 
 
+class SpatialCropError(ValueError):
+    """Invalid paired geometry for an interpolation-free crop/pad."""
+
+
+def _crop_in_plane(sample, target_size, mode):
+    """Center crop/pad aligned [C, D, H, W] tensors without changing depth.
+
+    Intensities are already normalized to [-1, 1]: pad images with -1 and
+    masks with 0. Odd extra pixels go on the high-index side of each axis.
+    """
+    shape = sample["mr"].shape
+    if any(volume.ndim != 4 or volume.shape[1:] != shape[1:]
+           for volume in sample.values()):
+        raise SpatialCropError("MRI, CT and mask must have matching depth and in-plane shapes.")
+    height, width = shape[-2:]
+    top = max(0, (height - target_size) // 2)
+    left = max(0, (width - target_size) // 2)
+    pad_h = max(0, target_size - height)
+    pad_w = max(0, target_size - width)
+    padding = (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2)
+    result = {}
+    for key, volume in sample.items():
+        patch = volume[..., top:top + target_size, left:left + target_size]
+        if pad_h or pad_w:
+            patch = torch.nn.functional.pad(patch, padding, mode="constant",
+                                            value=0.0 if key == "mask" else -1.0)
+        result[key] = patch.contiguous()
+    return result
+
+
 class MonaiNifti25DDataset(Dataset):
     """
     A PyTorch Dataset for 2.5D volumetric slices.
@@ -118,7 +150,7 @@ class MonaiNifti25DDataset(Dataset):
     Args:
         data (list of dict): List where each dict contains 'mr' and 'ct' file paths.
         transform (callable): MONAI Compose object for 3D volume transforms.
-        target_size (int): Target spatial size for slices (H, W).
+        target_size (int): In-plane center crop/pad size (H, W), without interpolation.
         num_slices (int): Number of consecutive slices to sample (depth dimension).
         stride (int): Stride between volume centers. If None, defaults to num_slices (non-overlapping).
     """
@@ -136,6 +168,8 @@ class MonaiNifti25DDataset(Dataset):
     ):
         self.file_list = data
         self.transform = transform
+        if not isinstance(target_size, int) or isinstance(target_size, bool) or target_size <= 0:
+            raise ValueError("target_size (image_size) must be a positive integer.")
         self.target_size = target_size
         self.num_slices = num_slices
         self.stride = stride if stride is not None else num_slices
@@ -236,6 +270,9 @@ class MonaiNifti25DDataset(Dataset):
 
             return self._getitem_uncached(file_idx, center_idx, file_paths)
             
+        except SpatialCropError as e:
+            # Never hide an incompatible crop behind the legacy zero-tensor fallback.
+            raise SpatialCropError(f"Patient {file_paths.get('id', file_paths['mr'])}: {e}") from e
         except Exception as e:
             print(f"Error loading 2.5D volume {idx} (file {file_paths.get('id', 'unknown')}, center {center_idx}): {e}")
             # Return zero tensors
@@ -274,35 +311,15 @@ class MonaiNifti25DDataset(Dataset):
             if mask_volume is not None and "mask" in aug_out:
                 mask_volume = aug_out["mask"]
 
-        if mr_volume.shape[2] != self.target_size or mr_volume.shape[3] != self.target_size:
-            C, D, H, W = mr_volume.shape
-            mr_volume = mr_volume.reshape(C * D, H, W)
-            ct_volume = ct_volume.reshape(C * D, H, W)
-
-            mr_volume = torch.nn.functional.interpolate(
-                mr_volume.unsqueeze(0),
-                size=(self.target_size, self.target_size),
-                mode='bilinear',
-                align_corners=False,
-            ).squeeze(0)
-            ct_volume = torch.nn.functional.interpolate(
-                ct_volume.unsqueeze(0),
-                size=(self.target_size, self.target_size),
-                mode='bilinear',
-                align_corners=False,
-            ).squeeze(0)
-            mr_volume = mr_volume.reshape(C, D, self.target_size, self.target_size)
-            ct_volume = ct_volume.reshape(C, D, self.target_size, self.target_size)
-
-            if mask_volume is not None:
-                Cm, Dm, Hm, Wm = mask_volume.shape
-                mask_volume = mask_volume.reshape(Cm * Dm, Hm, Wm)
-                mask_volume = torch.nn.functional.interpolate(
-                    mask_volume.unsqueeze(0),
-                    size=(self.target_size, self.target_size),
-                    mode='nearest',
-                ).squeeze(0)
-                mask_volume = mask_volume.reshape(Cm, Dm, self.target_size, self.target_size)
+        crop_input = {"mr": mr_volume, "ct": ct_volume}
+        if mask_volume is not None:
+            crop_input["mask"] = mask_volume
+        elif self.use_body_mask:
+            # Missing anatomy mask: retain acquired pixels, exclude padding.
+            crop_input["mask"] = torch.ones_like(mr_volume)
+        cropped = _crop_in_plane(crop_input, self.target_size, self.mode)
+        mr_volume, ct_volume = cropped["mr"], cropped["ct"]
+        mask_volume = cropped.get("mask")
 
         mr_volume = mr_volume.clamp(-1.0, 1.0)
         ct_volume = ct_volume.clamp(-1.0, 1.0)
@@ -345,45 +362,18 @@ class MonaiNifti25DDataset(Dataset):
             mask_volume = mask_vol[:, :, :, start_idx:end_idx]
             mask_volume = (mask_volume > 0).float()  # Binary conversion
 
-        # Resize spatial dimensions if needed
-        if mr_volume.shape[1] != self.target_size or mr_volume.shape[2] != self.target_size:
-            # Reshape to [C*D, H, W] for 2D interpolation
-            C, H, W, D = mr_volume.shape
-            mr_volume = mr_volume.permute(0, 3, 1, 2).reshape(C*D, H, W)
-            ct_volume = ct_volume.permute(0, 3, 1, 2).reshape(C*D, H, W)
-
-            mr_volume = torch.nn.functional.interpolate(
-                mr_volume.unsqueeze(0),
-                size=(self.target_size, self.target_size),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(0)
-
-            ct_volume = torch.nn.functional.interpolate(
-                ct_volume.unsqueeze(0),
-                size=(self.target_size, self.target_size),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(0)
-
-            # Reshape back to [C, H, W, D]
-            mr_volume = mr_volume.reshape(C, D, self.target_size, self.target_size).permute(0, 2, 3, 1)
-            ct_volume = ct_volume.reshape(C, D, self.target_size, self.target_size).permute(0, 2, 3, 1)
-
-            # Resize mask with nearest interpolation to preserve binary values
-            if mask_volume is not None:
-                Cm, Hm, Wm, Dm = mask_volume.shape
-                mask_volume = mask_volume.permute(0, 3, 1, 2).reshape(Cm*Dm, Hm, Wm)
-                mask_volume = torch.nn.functional.interpolate(
-                    mask_volume.unsqueeze(0),
-                    size=(self.target_size, self.target_size),
-                    mode='nearest',
-                ).squeeze(0)
-                mask_volume = mask_volume.reshape(Cm, Dm, self.target_size, self.target_size).permute(0, 2, 3, 1)
-
-        # Rearrange to [C, D, H, W] for 3D convolutions
-        mr_volume = mr_volume.permute(0, 3, 1, 2)  # [C, D, H, W]
-        ct_volume = ct_volume.permute(0, 3, 1, 2)  # [C, D, H, W]
+        # Use the same crop coordinates for all modalities and depth slices.
+        crop_input = {
+            "mr": mr_volume.permute(0, 3, 1, 2),
+            "ct": ct_volume.permute(0, 3, 1, 2),
+        }
+        if mask_volume is not None:
+            crop_input["mask"] = mask_volume.permute(0, 3, 1, 2)
+        elif self.use_body_mask:
+            crop_input["mask"] = torch.ones_like(crop_input["mr"])
+        cropped = _crop_in_plane(crop_input, self.target_size, self.mode)
+        mr_volume, ct_volume = cropped["mr"], cropped["ct"]
+        mask_volume = cropped.get("mask")
 
         output = {
             "mr": mr_volume.float(),
@@ -392,7 +382,6 @@ class MonaiNifti25DDataset(Dataset):
 
         if self.use_body_mask:
             if mask_volume is not None:
-                mask_volume = mask_volume.permute(0, 3, 1, 2)  # [C, D, H, W]
                 output["mask"] = mask_volume.float()
             else:
                 output["mask"] = torch.ones(1, self.num_slices, self.target_size, self.target_size, dtype=torch.float32)

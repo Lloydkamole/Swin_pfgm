@@ -1,0 +1,18 @@
+{
+  "selections": [
+    {
+      "run": "20260627_104352_pfgm_fir_25d",
+      "event_step": 165,
+      "epoch": 166,
+      "selection": "best_sample_psnr"
+    },
+    {
+      "run": "20260623_170925_pfgm_fir_25d",
+      "event_step": 191,
+      "epoch": 192,
+      "selection": "best_sample_ssim"
+    }
+  ],
+  "publication": "Not approved for public sharing",
+  "display": "Independent per-image TensorBoard normalization; raw intensities unavailable"
+}

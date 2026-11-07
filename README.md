@@ -123,19 +123,25 @@ accelerate launch --multi_gpu --num_processes 2 --gpu_ids 0,1 \
 | `configs/smoke_25d.json` | Tiny CPU pipeline check: 4 × 32 × 32 patches, batch 1, one epoch |
 | `configs/showcase_25d.json` | Sanitized logged hyperparameters from the highest sample-PSNR run; batch 10, 200 epochs |
 
-The patient list is shuffled with seed 42 and split 90%/10% by patient. New runs save `config.json` and `split.json` alongside logs and checkpoints. `split.json` contains local file paths and patient IDs and stays excluded from Git. Historical runs did not save a split manifest or source revision.
+Acquisition groups are shuffled with seed 42 and assigned intact to train/validation, targeting a 90%/10% patient split. The trainer discovers `dataset_split_groups.csv` in the data directory or its parent's `reports/`, following `preprocessing_settings.json` → `input_root` back through normalization outputs. This automatically uses the hospital preprocessing groups. For another layout, set `split_group_manifests` to a JSON mapping from data-root paths to CSV paths with `patient,split_group` columns. Paths are resolved relative to the working directory. A discovered CSV must cover every included case; incomplete/conflicting metadata fails early. Sources without grouping metadata emit a warning and use folder identity only, so their acquisition independence still needs verification. Identical patient IDs in unrelated sources are not automatically merged.
 
-Each run writes `checkpoints/best` selected by validation denoising loss, periodic epoch checkpoints, and `checkpoints/final`. TensorBoard logs include denoising losses, sampled image comparisons and center-slice image metrics:
+New runs save `config.json` and `split.json`, including group assignments, manifest paths and hashes. These contain local paths/IDs and stay excluded from Git. A corrected split requires a new run: changing a manifest does not undo exposure in an existing trained checkpoint.
+
+With a body mask, each patch's weighted error is divided by its own foreground voxel count, then averaged across nonempty patches. Empty masks contribute neither loss nor denominator; a globally empty batch skips the optimizer, scheduler and EMA update. DDP compensates for unequal valid-patch counts across ranks. Validation loss is aggregated by valid patches, excluding distributed last-batch padding. Unmasked loss retains its full-image mean. These loss values are not directly comparable to historical full-grid masked losses.
+
+Each run writes `checkpoints/best` selected by validation denoising loss using EMA (when enabled), `checkpoints/best_generation` selected by the lowest sampled validation foreground MAE, periodic epoch checkpoints, and `checkpoints/final`. Every checkpoint includes raw Accelerate training state, registered EMA state, a complete `model_ema.safetensors` for inference when EMA is enabled, and `training_state.json` with epoch, optimizer step and selection information. EMA weights are restored safely after evaluation. `best_generation` remains a changing-sample score, not a held-out cohort benchmark.
+
+`num_val_samples` controls validation generation independently of the training batch size: samples are collected across loader batches up to the available per-rank validation data and generated in chunks no larger than `batch_size`. The default remains 3; sample shuffling and random generation remain unchanged. Training previews still use at most one training batch. TensorBoard logs include denoising losses, sampled image comparisons, center-slice metrics, foreground voxel counts and valid SSIM window counts:
 
 ```bash
 tensorboard --logdir outputs_accelerate_25d
 ```
 
-The trainer contains an FSDP branch, but FSDP has not been verified and no validated FSDP configuration is shipped. The documented multi-GPU command uses DDP. Checkpoint resumption is not implemented; a non-null `resume` now fails explicitly instead of silently starting a fresh run. EMA is used for sampling during training but its shadow weights are not persisted in current checkpoints.
+The trainer contains an FSDP branch, but FSDP has not been verified and no validated FSDP configuration is shipped. The documented multi-GPU command uses DDP. Checkpoint resumption is not implemented; a non-null `resume` now fails explicitly instead of silently starting a fresh run. EMA is persisted in new checkpoints; historical checkpoints cannot recover missing EMA state. Sharded FSDP with EMA now fails explicitly; single-process and DDP checkpointing are supported.
 
 ## Patch inference and evaluation
 
-Use a plain `model.safetensors` and a configuration matching its architecture. This command predicts **one small volumetric patch**, not a complete CT volume:
+Use a checkpoint directory or plain safetensors file and a configuration matching its architecture. Inference defaults to `--weights auto`, which prefers `model_ema.safetensors` beside `model.safetensors`, falling back to raw weights for legacy checkpoints. `--weights ema` requires EMA; `--weights raw` explicitly selects raw weights. This command predicts **one small volumetric patch**, not a complete CT volume:
 
 ```bash
 python inference_25d.py \
@@ -149,9 +155,11 @@ python inference_25d.py \
 
 When a body mask is available, generated CT voxels outside it are set to **-1** in the model's output scale, which maps to **0 (black)** in `[0, 1]`. This final-output processing also applies to training/validation previews and flip-augmented sampling; foreground values and sampler dynamics are preserved. Without a mask, the output is left unmasked.
 
-`--ct` is optional; provide it for a reference comparison and center-slice PSNR/SSIM/MAE. `--mask` is optional. `--patch-index`, `--steps`, and `--seed` select the patch and sampling settings. CPU execution is available with `--device cpu`. Output includes `prediction.safetensors` with shape `[1, 1, D, H, W]`, `comparison.png` with a fixed `[-1, 1]` display, and `metrics.json`. Weights load strictly; sharded FSDP checkpoints and automatic EMA restoration are unsupported.
+`--ct` is optional; provide it for a reference comparison and center-slice PSNR/SSIM/MAE. `--mask` is optional. `--patch-index`, `--steps`, and `--seed` select the patch and sampling settings. CPU execution is available with `--device cpu`. Output includes `prediction.safetensors` with shape `[1, 1, D, H, W]`, `comparison.png` with a fixed `[-1, 1]` display, and `metrics.json`. Weights load strictly; sharded FSDP inference is unsupported. `metrics.json` records the actual checkpoint and weight type.
 
-Metrics clamp the predicted center slice to `[-1, 1]`, map images to `[0, 1]`, and use data range 1. With a mask, PSNR/SSIM are computed on images whose background is zeroed; background pixels remain in their calculation. MAE is averaged within the mask. These scores are normalized-intensity metrics, not HU errors, and are not interchangeable with official SynthRAD challenge metrics. There is no complete-volume or held-out test-set evaluation script in this public scope.
+Metrics clamp the predicted center slice to `[-1, 1]`, map images to `[0, 1]`, and use data range 1. PSNR is computed from foreground-only pooled MSE; MAE also pools only foreground voxels. SSIM uses standard 11×11 Gaussian windows (sigma 1.5) and averages only windows entirely inside the mask and image: background never contributes, including near ROI boundaries. Images without masks use all pixels and all valid SSIM windows. Empty masks have no score; masks with no complete window have no SSIM. Undefined scores are omitted from TensorBoard and represented as `null` in inference JSON, never replaced with perfect-background scores. Counts (`foreground_pixels`, `ssim_windows`) expose the evaluated support. Historical PSNR/SSIM values included background and are not directly comparable.
+
+These scores are normalized-intensity metrics, not HU errors, and are not interchangeable with official SynthRAD challenge metrics. There is no complete-volume or held-out test-set evaluation script in this public scope.
 
 ## Recorded experimental results
 
@@ -176,10 +184,17 @@ The tiny 0.11M-parameter CPU example and one-epoch training check were run succe
 
 Volume caching holds the full prepared dataset in RAM for each training process. Memory needs depend on volume sizes and process count. bf16 requires hardware support; use `mixed_precision: "no"` when unavailable.
 
-The scientific training/model/metric calculations were preserved during repository cleanup. Remaining limitations include missing historical preprocessing and split manifests, sampled validation reporting, absent public trained weights, missing EMA checkpoint state, incomplete resumption/FSDP support, and patch-only inference. The preview does not establish generalization, superiority to other methods, or clinical usefulness.
+The scientific training/model/metric calculations were preserved during repository cleanup. Remaining limitations include missing historical preprocessing and split manifests, sampled validation reporting, absent public trained weights, missing historical EMA checkpoint state, incomplete resumption/FSDP support, and patch-only inference. The preview does not establish generalization, superiority to other methods, or clinical usefulness.
 
 ## Attribution, license, and repository review
 
 See [ATTRIBUTION.md](ATTRIBUTION.md) for method and dataset references. The preceding README declared MIT, but no project `LICENSE` file was present in accessible history. That declaration is retained as a historical statement, not replaced with a newly assumed license. The author should confirm the project license and add its text before release; dataset images retain their separate terms.
 
 [Repository audit](docs/repository_audit.md) documents the history/privacy review and preserved local files. [Validation](docs/validation.md) lists executed checks and untested paths. Nothing has been pushed or published by this cleanup.
+
+Focused regression checks for the foreground objective, masked metrics, grouping, and EMA save/load:
+
+```bash
+python -m tools.check_training_25d
+python -m tools.check_25d
+```

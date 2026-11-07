@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -11,12 +12,15 @@ from safetensors.torch import load_file
 from examples.synthetic_demo import save_comparison
 from loader_25d import MonaiNifti25DDataset, get_monai_nifti_transforms_25d
 from train_accelerate_25d import build_model, compute_masked_metrics, edm_sample, load_config, mask_generated_ct
+from training_support_25d import resolve_inference_checkpoint
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True, help="Plain model.safetensors; sharded FSDP files unsupported")
+    parser.add_argument("--checkpoint", type=Path, required=True, help="Checkpoint directory or safetensors file; sharded FSDP unsupported")
+    parser.add_argument("--weights", choices=["auto", "ema", "raw"], default="auto",
+                        help="auto prefers model_ema.safetensors beside model.safetensors")
     parser.add_argument("--mr", type=Path, required=True)
     parser.add_argument("--ct", type=Path, help="Optional aligned reference CT for center-slice metrics")
     parser.add_argument("--mask", type=Path)
@@ -47,7 +51,8 @@ def main():
     mask = patch.get("mask")
     mask = mask.unsqueeze(0).to(args.device) if mask is not None else None
     model = build_model(cfg).to(args.device).eval()
-    model.load_state_dict(load_file(str(args.checkpoint), device=args.device), strict=True)
+    checkpoint_path, weight_type = resolve_inference_checkpoint(args.checkpoint, args.weights)
+    model.load_state_dict(load_file(str(checkpoint_path), device=args.device), strict=True)
     kwargs = {key: cfg[key] for key in ["sigma_min", "sigma_max", "sigma_data", "rho", "S_churn",
               "S_min", "S_max", "S_noise", "cfg_scale", "pfgmpp", "D", "use_cfg_plus_plus",
               "cfg_rescale_factor", "use_dynamic_cfg", "cfg_scale_min", "cfg_scale_max"]}
@@ -61,7 +66,8 @@ def main():
     panels = [("MRI input", mr[0, 0, center]), ("Predicted CT", prediction[0, 0, center])]
     report = {"seed": args.seed, "patch_index": args.patch_index, "shape": list(prediction.shape),
               "background": "-1 outside the supplied body mask; 0 after mapping to [0, 1]",
-              "weight_type": "raw checkpoint weights; EMA weights not restored", "metrics": {}}
+              "weight_type": weight_type, "checkpoint": str(checkpoint_path),
+              "metric_scope": "foreground voxels; SSIM windows entirely inside mask", "metrics": {}}
     if args.ct:
         ct = patch["ct"].unsqueeze(0).to(args.device)
         panels.insert(1, ("CT reference", ct[0, 0, center]))
@@ -71,6 +77,8 @@ def main():
             psnr_metric=torchmetrics.image.PeakSignalNoiseRatio(data_range=1.0).to(args.device),
             ssim_metric=torchmetrics.image.StructuralSimilarityIndexMeasure(data_range=1.0).to(args.device),
             mae_metric=torchmetrics.MeanAbsoluteError().to(args.device))
+        report["metrics"] = {k: (v if math.isfinite(v) else None)
+                             for k, v in report["metrics"].items()}
     args.output_dir.mkdir(parents=True, exist_ok=True)
     # Patch tensor only: no claim to reconstruct a full-volume NIfTI affine.
     from safetensors.torch import save_file

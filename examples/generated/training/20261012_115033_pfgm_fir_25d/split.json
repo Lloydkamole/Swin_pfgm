@@ -1,0 +1,30 @@
+{
+  "train": [
+    {
+      "mr": "examples/generated/data/phantom_002/mr.nii.gz",
+      "ct": "examples/generated/data/phantom_002/ct.nii.gz",
+      "id": "phantom_002",
+      "mask": "examples/generated/data/phantom_002/mask.nii.gz"
+    },
+    {
+      "mr": "examples/generated/data/phantom_001/mr.nii.gz",
+      "ct": "examples/generated/data/phantom_001/ct.nii.gz",
+      "id": "phantom_001",
+      "mask": "examples/generated/data/phantom_001/mask.nii.gz"
+    },
+    {
+      "mr": "examples/generated/data/phantom_003/mr.nii.gz",
+      "ct": "examples/generated/data/phantom_003/ct.nii.gz",
+      "id": "phantom_003",
+      "mask": "examples/generated/data/phantom_003/mask.nii.gz"
+    }
+  ],
+  "validation": [
+    {
+      "mr": "examples/generated/data/phantom_000/mr.nii.gz",
+      "ct": "examples/generated/data/phantom_000/ct.nii.gz",
+      "id": "phantom_000",
+      "mask": "examples/generated/data/phantom_000/mask.nii.gz"
+    }
+  ]
+}

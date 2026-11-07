@@ -1,0 +1,84 @@
+D: 128
+P_mean: -0.8
+P_std: 1.0
+S_churn: 20.0
+S_max: .inf
+S_min: 0.0
+S_noise: 1.0
+attention_resolutions: '[2]'
+attention_type: deformable
+base_channels: 8
+batch_size: 1
+cache_volumes: true
+cfg_rescale_factor: 0.7
+cfg_scale: 2.0
+cfg_scale_max: 2.0
+cfg_scale_min: 1.0
+channel_mults: '[1, 2]'
+cond_drop_prob: 0.1
+cond_drop_prob_end_epoch: 0
+cpu: true
+ct_pattern: ct.nii
+data_dir: examples/generated/data
+deformable_kwargs: '{''n_groups'': 2, ''kv_stride'': 2, ''offset_range_factor'': 8.0,
+  ''use_qk_norm'': True}'
+deformable_sfb_kwargs: '{''kernel_size'': [1, 3, 3], ''offset_scale'': 1.0, ''use_modulation'':
+  False, ''deformable_depth'': False}'
+downsample_strides_3d: '[[1, 2, 2]]'
+drop_path: 0.05
+dropout: 0.1
+ema_decay: 0.9999
+ema_update_every: 1
+grad_clip: 1.0
+grad_log_interval: 100
+gradient_checkpoint: false
+image_size: 32
+log_every: 5
+log_gradients: false
+log_ode_trajectory: false
+loss_type: l2
+lr: 0.0001
+mask_outside_value: -1.0
+mask_pattern: mask
+mask_threshold: -0.7
+masked_loss_ratio: 0.5
+mixed_precision: 'no'
+mlp_ratio: 4.0
+mr_pattern: mr.nii
+num_bottleneck_blocks: 1
+num_epochs: 1
+num_heads: 2
+num_res_blocks: 1
+num_sample_steps: 2
+num_sfb_blocks: 1
+num_slices: 4
+num_swin_blocks: 1
+num_val_samples: 1
+num_workers: 0
+output_dir: examples/generated/training
+pfgmpp: true
+radius_emb_dim: 32
+resume: None
+rho: 7.0
+sample_every: 1
+save_every: 20
+seed: 42
+sigma_data: 0.45
+sigma_max: 80.0
+sigma_min: 0.002
+slice_stride: 2
+train_split: 0.9
+tta_flips: '[''lr'', ''ud'', ''lr_ud'']'
+use_body_mask: true
+use_cfg_plus_plus: true
+use_deformable_sfb: false
+use_dynamic_cfg: true
+use_ema: true
+use_masked_loss: false
+use_sfb: true
+use_tta: false
+val_every: 1
+warmup_steps: 1
+weight_decay: 0.01
+window_size: 4
+window_size_3d: '[2, 4, 4]'

@@ -1,0 +1,18 @@
+{
+  "purpose": "Pipeline check, not trained synthesis results",
+  "seed": 42,
+  "shape": [
+    1,
+    1,
+    4,
+    32,
+    32
+  ],
+  "loss": 0.44548916816711426,
+  "finite_gradients": true,
+  "finite_prediction": true,
+  "masked_background_is_black": true,
+  "optimization_steps": 1,
+  "sampling_steps": 2,
+  "sampling_sigma_max": 1.0
+}

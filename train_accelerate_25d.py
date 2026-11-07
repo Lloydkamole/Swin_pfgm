@@ -38,6 +38,7 @@ import math
 import time
 import random
 import datetime
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -52,7 +53,7 @@ import torchvision.utils as vutils
 
 # Hugging Face Accelerate
 from accelerate import Accelerator, DistributedType
-from accelerate.utils import set_seed, ProjectConfiguration
+from accelerate.utils import set_seed, ProjectConfiguration, broadcast_object_list
 
 # Metrics
 try:
@@ -67,6 +68,10 @@ from loader_25d import MonaiNifti25DDataset, get_monai_nifti_transforms_25d
 
 # Import 2.5D model
 from models.network_25d import create_swin_fir_unet_25d
+from training_support_25d import (
+    patch_means, valid_patch_mean, foreground_metrics, split_by_acquisition_group,
+    collect_generation_batch,
+)
 
 # Compatibility fix for Pillow >= 10
 try:
@@ -146,9 +151,29 @@ class EMA:
         }
     
     def load_state_dict(self, state_dict):
-        self.shadow = state_dict['shadow']
+        if self.shadow.keys() != state_dict['shadow'].keys():
+            raise ValueError("EMA checkpoint parameter names do not match the model")
+        for name, value in state_dict['shadow'].items():
+            if value.shape != self.shadow[name].shape:
+                raise ValueError(f"EMA checkpoint shape mismatch: {name}")
+        self.shadow = {name: value.to(self.shadow[name]).clone()
+                       for name, value in state_dict['shadow'].items()}
         self.num_updates = state_dict['num_updates']
         self.decay = state_dict.get('decay', self.decay)
+
+    @contextmanager
+    def average_parameters(self):
+        """Restore trainable weights even when sampling or evaluation fails."""
+        self.apply_shadow()
+        try:
+            yield
+        finally:
+            self.restore()
+
+    def inference_state_dict(self):
+        """Complete state (including buffers), ready for strict inference loading."""
+        return {name: self.shadow.get(name, value).detach().cpu().contiguous().clone()
+                for name, value in self.model.state_dict().items()}
 
 
 # =============================================================================
@@ -157,11 +182,15 @@ class EMA:
 
 config = {
     # Data Settings
-    "data_dir": None,  # Set with --data-dir or a JSON configuration.
+    "data_dir": [  # One directory or a list; --data-dir can override this.
+        "/mnt/nvme/lloyd/AR PFGM/brain_monai_trimmed_v1/training",
+        "/mnt/nvme/lloyd/DL project CT-MRI/pfgm_brain_train_n",
+    ],
     "mr_pattern": "mr.nii",
     "ct_pattern": "ct.nii",
     "train_split": 0.9,
-    "image_size": 256,
+    "split_group_manifests": {},  # Optional data-root -> patient,split_group CSV overrides.
+    "image_size": 256,  # Centered H/W crop/pad for train and val; no interpolation.
     
     # 2.5D Settings
     "num_slices": 4,           # Number of consecutive slices (divisible by 2 for attention)
@@ -183,9 +212,9 @@ config = {
     # Per-stage encoder downsampling strides as [D, H, W].
     # For 4 stages, only the first 3 entries are used by encoder downsamples;
     # the decoder mirrors them in reverse. Use [1, 2, 2] to preserve depth.
-    "downsample_strides_3d": [[2, 2, 2], [2, 2, 2], [2, 2, 2], [1, 2, 2]],
-    "dropout": 0.1,
-    "drop_path": 0.05,                    # Stochastic depth rate (matches 2D)
+    "downsample_strides_3d": [[1, 2, 2], [2, 2, 2], [2, 2, 2], [2, 2, 2]],
+    "dropout": 0.0,
+    "drop_path": 0.1,                    # Stochastic depth rate (matches 2D)
     "gradient_checkpoint": True,  # Trade ~30% speed for ~60% activation memory savings
 
     # SwinFIR / Attention architecture (mirrors 2D `train_accelerate.py`)
@@ -253,7 +282,7 @@ config = {
     
     # Training Parameters
     "num_epochs": 300,
-    "batch_size": 5,  # Smaller batch size for 3D convolutions
+    "batch_size": 10,  # Smaller batch size for 3D convolutions
     "lr": 1e-4,  # Matches 2D canonical
     "weight_decay": 0.01,
     "grad_clip": 1.0,  # Matches 2D canonical
@@ -301,9 +330,13 @@ def _filename_matches(filename: str, pattern: str) -> bool:
     return pattern.lower() in filename.lower()
 
 
-def collect_data_files(data_path: str, mr_pattern: str = "mr.nii", ct_pattern: str = "ct.nii",
+def collect_data_files(data_path, mr_pattern: str = "mr.nii", ct_pattern: str = "ct.nii",
                        mask_pattern: str = "mask", use_body_mask: bool = False):
-    """Collect MR, CT, and optionally mask file pairs from directory structure."""
+    """Collect MR, CT, and optional masks from one or more patient directories."""
+    if isinstance(data_path, (list, tuple)):
+        return [entry for root in data_path for entry in collect_data_files(
+            root, mr_pattern, ct_pattern, mask_pattern, use_body_mask
+        )]
     data_files = []
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"Data path not found: {data_path}")
@@ -313,16 +346,27 @@ def collect_data_files(data_path: str, mr_pattern: str = "mr.nii", ct_pattern: s
         if not os.path.isdir(patient_path):
             continue
         
-        mr_file = None
-        ct_file = None
-        mask_file = None
-        for filename in os.listdir(patient_path):
-            if _filename_matches(filename, mr_pattern):
-                mr_file = os.path.join(patient_path, filename)
-            if _filename_matches(filename, ct_pattern):
-                ct_file = os.path.join(patient_path, filename)
-            if use_body_mask and _filename_matches(filename, mask_pattern):
-                mask_file = os.path.join(patient_path, filename)
+        filenames = [name for name in os.listdir(patient_path)
+                     if name.lower().endswith((".nii", ".nii.gz"))
+                     and os.path.isfile(os.path.join(patient_path, name))]
+
+        def choose_file(pattern, preferred):
+            matches = sorted(name for name in filenames if _filename_matches(name, pattern))
+            # A broad "ct.nii" pattern also matches "labels_ct.nii.gz".
+            # Prefer the established image names before substring fallbacks.
+            for exact in preferred:
+                selected = [name for name in matches if name.lower() == exact]
+                if len(selected) == 1:
+                    return os.path.join(patient_path, selected[0])
+                if len(selected) > 1:
+                    raise ValueError(f"Ambiguous filenames in {patient_path}: {selected}")
+            if len(matches) > 1:
+                raise ValueError(f"Ambiguous pattern {pattern!r} in {patient_path}: {matches}")
+            return os.path.join(patient_path, matches[0]) if matches else None
+
+        mr_file = choose_file(mr_pattern, ("mr.nii_processed_patch.nii.gz", "mr.nii.gz", "mr.nii"))
+        ct_file = choose_file(ct_pattern, ("ct.nii_processed_patch.nii.gz", "ct.nii.gz", "ct.nii"))
+        mask_file = choose_file(mask_pattern, ("mask_processed_patch.nii.gz", "mask.nii.gz", "mask.nii")) if use_body_mask else None
         
         if mr_file and ct_file:
             entry = {"mr": mr_file, "ct": ct_file, "id": patient_dir}
@@ -559,7 +603,8 @@ def edm_loss(
     pfgmpp: bool = False,
     D: int = 128,
     body_mask: torch.Tensor = None,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
+    return_patch_losses: bool = False,
+) -> Tuple[torch.Tensor, Dict]:
     """
     Compute EDM/PFGM++ loss for 2.5D model with optional masking.
     
@@ -594,42 +639,27 @@ def edm_loss(
     weight = (sigma_v ** 2 + sigma_data ** 2) / ((sigma_v * sigma_data) ** 2)
     weight = weight.clamp(max=1000.0)
     
-    # Apply body mask if provided (nnsyn-style masked training)
-    mask_used = None
-    use_mask_this_batch = False
-    
-    if body_mask is not None:
-        use_mask_this_batch = True
-        mask_used = body_mask
-        weight = weight * body_mask
-    elif use_masked_loss and model.training:
+    # Each nonempty patch contributes one foreground-normalized loss.
+    mask_used = body_mask
+    if mask_used is None and use_masked_loss and model.training:
         if torch.rand(1).item() < masked_loss_ratio:
-            use_mask_this_batch = True
             mask_used = (x_clean > mask_threshold).float()
-            weight = weight * mask_used
-    
+
     if loss_type == 'l1':
-        loss = (weight * (D_x - x_clean).abs()).mean()
+        error = (D_x - x_clean).abs()
     elif loss_type == 'l2':
-        loss = (weight * (D_x - x_clean) ** 2).mean()
+        error = (D_x - x_clean).square()
     elif loss_type == 'huber':
-        loss = (weight * F.smooth_l1_loss(D_x, x_clean, reduction='none')).mean()
+        error = F.smooth_l1_loss(D_x, x_clean, reduction='none')
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
-    
+    per_patch, patch_valid = patch_means(weight * error, mask_used)
+    loss = valid_patch_mean(per_patch, patch_valid)
+
     # Metrics for logging
     with torch.no_grad():
-        if mask_used is not None:
-            masked_pred = D_x * mask_used
-            masked_target = x_clean * mask_used
-            num_masked_pixels = mask_used.sum()
-            if num_masked_pixels > 0:
-                mse = ((masked_pred - masked_target) ** 2).sum() / num_masked_pixels
-                mse = mse.item()
-            else:
-                mse = F.mse_loss(D_x, x_clean).item()
-        else:
-            mse = F.mse_loss(D_x, x_clean).item()
+        per_patch_mse, mse_valid = patch_means((D_x - x_clean).square(), mask_used)
+        mse = valid_patch_mean(per_patch_mse, mse_valid).item()
         pred_std = D_x.std().item()
         target_std = x_clean.std().item()
     
@@ -642,12 +672,16 @@ def edm_loss(
         'sigma_min': sigma.min().item(),
     }
     
-    if use_mask_this_batch and mask_used is not None:
+    if mask_used is not None:
         metrics['mask_ratio'] = mask_used.mean().item()
         metrics['masked'] = 1.0
     else:
         metrics['masked'] = 0.0
     
+    metrics['valid_patches'] = int(patch_valid.sum())
+    if return_patch_losses:
+        metrics['patch_losses'] = per_patch.detach()
+        metrics['patch_valid'] = patch_valid.detach()
     return loss, metrics
 
 
@@ -663,58 +697,17 @@ def compute_masked_metrics(
     ssim_metric=None,
     mae_metric=None,
 ) -> Dict[str, float]:
+    """Metrics in [0,1], excluding background and empty masks.
+
+    PSNR/MAE pool foreground voxels. SSIM averages only 11x11 Gaussian
+    windows wholly inside the mask, so exterior voxels cannot affect it.
+    Undefined scores are NaN. Metric arguments retain the existing API and
+    select which scores to return; TorchMetrics state is not accumulated.
     """
-    Compute image quality metrics with optional masking (nnsyn-style).
-    Works on 2D center slices [B, C, H, W] extracted from 5D volumes.
-    
-    Args:
-        pred: Predicted image [B, C, H, W] in [0, 1] range
-        target: Target image [B, C, H, W] in [0, 1] range
-        mask: Binary body mask [B, C, H, W] (1=body, 0=outside)
-    """
-    metrics = {}
-    
-    # Reset torchmetrics state to avoid accumulating across calls (mirrors 2D)
-    if psnr_metric is not None:
-        psnr_metric.reset()
-    if ssim_metric is not None:
-        ssim_metric.reset()
-    if mae_metric is not None:
-        mae_metric.reset()
-    
-    if mask is not None:
-        pred_masked = pred * mask
-        target_masked = target * mask
-    else:
-        pred_masked = pred
-        target_masked = target
-    
-    if psnr_metric is not None:
-        psnr_val = psnr_metric(pred_masked, target_masked)
-        metrics['psnr'] = psnr_val.item()
-    
-    if ssim_metric is not None:
-        if mask is not None:
-            pred_for_ssim = pred * mask + (1 - mask) * 0.0
-            target_for_ssim = target * mask + (1 - mask) * 0.0
-            ssim_val = ssim_metric(pred_for_ssim, target_for_ssim)
-        else:
-            ssim_val = ssim_metric(pred_masked, target_masked)
-        metrics['ssim'] = ssim_val.item()
-    
-    if mae_metric is not None:
-        if mask is not None:
-            num_masked = mask.sum()
-            if num_masked > 0:
-                mae_val = (pred_masked - target_masked).abs().sum() / num_masked
-                metrics['mae'] = mae_val.item()
-            else:
-                metrics['mae'] = mae_metric(pred, target).item()
-        else:
-            mae_val = mae_metric(pred_masked, target_masked)
-            metrics['mae'] = mae_val.item()
-    
-    return metrics
+    scores = foreground_metrics(pred, target, mask)
+    return {key: value for key, value in scores.items()
+            if key in {"foreground_pixels", "ssim_windows"}
+            or {"psnr": psnr_metric, "ssim": ssim_metric, "mae": mae_metric}.get(key) is not None}
 
 
 # =============================================================================
@@ -1023,6 +1016,42 @@ def build_model(cfg: dict):
     )
 
 
+def save_training_checkpoint(accelerator, model, ema, directory, epoch, global_step,
+                             selection=None):
+    """All ranks save training state; main rank also exports complete EMA weights."""
+    directory = Path(directory)
+    accelerator.save_state(directory)
+    if accelerator.is_main_process:
+        if ema is not None:
+            from safetensors.torch import save_file
+            save_file(ema.inference_state_dict(), str(directory / "model_ema.safetensors"),
+                      metadata={"weight_type": "ema", "epoch": str(epoch),
+                                "global_step": str(global_step)})
+        (directory / "training_state.json").write_text(json.dumps({
+            "epoch": epoch, "global_step": global_step,
+            "evaluation_weights": "ema" if ema is not None else "raw",
+            "ema_updates": ema.num_updates if ema is not None else None,
+            "selection": selection,
+        }, indent=2, allow_nan=False) + "\n")
+    accelerator.wait_for_everyone()
+
+
+def sample_generation_batches(model, mri, batch_size, use_tta=False, tta_flips=(), **kwargs):
+    """Bound forward memory independently of the requested evaluation sample count."""
+    mask = kwargs.pop("mask", None)
+    outputs = []
+    for start in range(0, len(mri), batch_size):
+        mr_chunk = mri[start:start + batch_size]
+        mask_chunk = mask[start:start + batch_size] if mask is not None else None
+        if use_tta:
+            output = edm_sample_tta(model, mr_chunk, tta_flips=tta_flips,
+                                    mask=mask_chunk, **kwargs)
+        else:
+            output = edm_sample(model, mr_chunk, mask=mask_chunk, **kwargs)
+        outputs.append(output)
+    return torch.cat(outputs)
+
+
 
 def train(cfg: dict):
     """Main training function with Accelerate for 2.5D model."""
@@ -1047,6 +1076,14 @@ def train(cfg: dict):
         project_config=project_config,
         log_with="tensorboard",
     )
+
+    # Workers may initialize on different seconds. All checkpoint state must
+    # share rank zero's directory, including per-rank random-number state.
+    run_paths = [str(output_dir)]
+    broadcast_object_list(run_paths, from_process=0)
+    output_dir = Path(run_paths[0])
+    accelerator.project_configuration.project_dir = str(output_dir)
+    accelerator.project_configuration.logging_dir = str(output_dir / "logs")
     
     # Set seed
     set_seed(cfg["seed"])
@@ -1087,6 +1124,9 @@ def train(cfg: dict):
     
     # Check if FSDP is enabled
     is_fsdp = accelerator.distributed_type == DistributedType.FSDP
+    if is_fsdp and cfg.get("use_ema", True):
+        raise NotImplementedError("EMA checkpointing supports single-process/DDP training; "
+                                  "sharded FSDP EMA is not supported")
     if accelerator.is_main_process:
         print(f"Distributed type: {accelerator.distributed_type}")
         if is_fsdp:
@@ -1119,14 +1159,14 @@ def train(cfg: dict):
         use_body_mask=use_body_mask,
     )
     
-    random.shuffle(all_files)
-    split_idx = max(1, int(len(all_files) * cfg["train_split"]))
-    train_files = all_files[:split_idx]
-    val_files = all_files[split_idx:] if len(all_files) > split_idx else None
+    train_files, val_files, split_metadata = split_by_acquisition_group(
+        all_files, cfg["train_split"], cfg["seed"], cfg.get("split_group_manifests")
+    )
     
     if accelerator.is_main_process:
         (output_dir / "split.json").write_text(json.dumps({
             "train": train_files, "validation": val_files or [],
+            "grouping": split_metadata,
         }, indent=2) + "\n")
         print(f"Found {len(train_files)} train, {len(val_files) if val_files else 0} val patients")
         if use_body_mask:
@@ -1237,6 +1277,7 @@ def train(cfg: dict):
             decay=cfg.get("ema_decay", 0.9999),
             device=accelerator.device,
         )
+        accelerator.register_for_checkpointing(ema)
         if accelerator.is_main_process:
             print(f"EMA enabled with decay={cfg.get('ema_decay', 0.9999)}")
     
@@ -1268,6 +1309,7 @@ def train(cfg: dict):
     
     global_step = 0
     best_val_loss = float('inf')
+    best_gen_mae = float('inf')
     
     # =========================================================================
     # Training loop
@@ -1276,7 +1318,7 @@ def train(cfg: dict):
         epoch_start = time.time()
         model.train()
         epoch_loss = 0.0
-        num_batches = 0
+        epoch_valid_patches = 0
         
         # Linearly decay cond_drop_prob from initial value to 0.0
         cond_drop_start = cfg.get("cond_drop_prob", 0.0)
@@ -1321,7 +1363,19 @@ def train(cfg: dict):
                     body_mask=body_mask,
                 )
                 
-                accelerator.backward(loss)
+                # DDP averages gradients across ranks. Compensate for unequal
+                # foreground-patch counts so the objective is a global mean.
+                local_count = loss.new_tensor(metrics['valid_patches'])
+                totals = accelerator.reduce(torch.stack([
+                    loss.detach() * local_count, local_count,
+                ]), reduction="sum")
+                scaled_loss = loss * (local_count * accelerator.num_processes /
+                                      totals[1].clamp_min(1))
+                accelerator.backward(scaled_loss)
+                if totals[1].item() == 0:
+                    # No foreground anywhere: no AdamW decay, schedule or EMA update.
+                    optimizer.zero_grad()
+                    continue
                 
                 if cfg["grad_clip"] and cfg["grad_clip"] > 0:
                     accelerator.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
@@ -1335,9 +1389,9 @@ def train(cfg: dict):
                     ema.update()
             
             # Gather loss across processes
-            gathered_loss = accelerator.gather(loss.detach()).mean()
-            epoch_loss += gathered_loss.item()
-            num_batches += 1
+            gathered_loss = totals[0] / totals[1]
+            epoch_loss += totals[0].item()
+            epoch_valid_patches += totals[1].item()
             
             pbar.set_postfix({
                 "loss": f"{gathered_loss.item():.3e}",
@@ -1384,7 +1438,9 @@ def train(cfg: dict):
         # =====================================================================
         # Epoch stats
         # =====================================================================
-        avg_loss = epoch_loss / num_batches
+        if epoch_valid_patches == 0:
+            raise ValueError("Training epoch contained no foreground patches")
+        avg_loss = epoch_loss / epoch_valid_patches
         epoch_time = time.time() - epoch_start
         
         accelerator.log({
@@ -1421,12 +1477,177 @@ def train(cfg: dict):
                 with torch.no_grad():
                     unwrapped_model = accelerator.unwrap_model(model)
                     
-                    # Apply EMA weights for better generation quality
-                    if ema is not None:
-                        ema.apply_shadow()
+                    with (ema.average_parameters() if ema is not None else nullcontext()):
+                        # Build sample kwargs
+                        sample_kwargs = dict(
+                            num_steps=cfg["num_sample_steps"],
+                            sigma_min=cfg["sigma_min"],
+                            sigma_max=cfg["sigma_max"],
+                            sigma_data=cfg["sigma_data"],
+                            rho=cfg["rho"],
+                            S_churn=cfg.get("S_churn", 0.0),
+                            S_min=cfg.get("S_min", 0.0),
+                            S_max=cfg.get("S_max", float('inf')),
+                            S_noise=cfg.get("S_noise", 1.0),
+                            cfg_scale=cfg.get("cfg_scale", 1.0),
+                            pfgmpp=cfg.get("pfgmpp", False),
+                            D=cfg.get("D", 128),
+                            use_cfg_plus_plus=cfg.get("use_cfg_plus_plus", False),
+                            cfg_rescale_factor=cfg.get("cfg_rescale_factor", 0.7),
+                            use_dynamic_cfg=cfg.get("use_dynamic_cfg", False),
+                            cfg_scale_min=cfg.get("cfg_scale_min", 1.0),
+                            cfg_scale_max=cfg.get("cfg_scale_max", 3.0),
+                            mask=sample_mask.to(accelerator.device) if sample_mask is not None else None,
+                        )
                     
-                    # Build sample kwargs
-                    sample_kwargs = dict(
+                        if cfg.get("log_ode_trajectory", False):
+                            pred_ct, ode_stats = edm_sample(
+                                unwrapped_model, mr_samples,
+                                return_trajectory_stats=True,
+                                **sample_kwargs,
+                            )
+                            accelerator.log({
+                                "ode/initial_norm": ode_stats['initial_norm'],
+                                "ode/final_norm": ode_stats['final_norm'],
+                                "ode/mean_denoised_norm": ode_stats['mean_denoised_norm'],
+                                "ode/mean_score_norm": ode_stats['mean_score_norm'],
+                                "ode/mean_update_norm": ode_stats['mean_update_norm'],
+                            }, step=epoch)
+                        else:
+                            pred_ct = edm_sample(
+                                unwrapped_model, mr_samples,
+                                **sample_kwargs,
+                            )
+                    
+                        # Extract center slice for visualization [B, 1, D, H, W] → [B, 1, H, W]
+                        center_idx = cfg["num_slices"] // 2
+                        pred_ct_center = pred_ct[:, :, center_idx, :, :]
+                        ct_samples_center = ct_samples[:, :, center_idx, :, :]
+                        mr_samples_center = mr_samples[:, :, center_idx, :, :]
+                    
+                        pred_ct_center = torch.clamp(pred_ct_center, -1.0, 1.0)
+                        pred_ct_01 = (pred_ct_center + 1.0) / 2.0
+                        ct_samples_01 = (ct_samples_center + 1.0) / 2.0
+                    
+                        # Prepare mask for metrics (extract center slice)
+                        mask_for_metrics = None
+                        if sample_mask is not None and cfg.get("use_body_mask", False):
+                            mask_for_metrics = sample_mask[:, :, center_idx, :, :].to(pred_ct.device)
+                    
+                        if psnr_metric is not None:
+                            gen_metrics = compute_masked_metrics(
+                                pred_ct_01, ct_samples_01,
+                                mask=mask_for_metrics,
+                                psnr_metric=psnr_metric,
+                                ssim_metric=ssim_metric,
+                                mae_metric=mae_metric,
+                            )
+
+                            log_dict = {f"gen/{key}": value for key, value in gen_metrics.items()
+                                        if math.isfinite(value)}
+
+                            accelerator.log(log_dict, step=epoch)
+                            mae_str = f", MAE={gen_metrics['mae']:.5f}" if 'mae' in gen_metrics else ""
+                            mask_str = " (masked)" if mask_for_metrics is not None else ""
+                            print(f"  Generation{mask_str} (center slice): PSNR={gen_metrics.get('psnr', 0.0):.3f}, SSIM={gen_metrics.get('ssim', 0.0):.5f}{mae_str}")
+                    
+                        # Log training sample images to TensorBoard
+                        img_grid = vutils.make_grid(
+                            torch.cat([mr_samples_center.cpu(), pred_ct_center.cpu(), ct_samples_center.cpu()], dim=0),
+                            nrow=cfg["num_val_samples"],
+                            normalize=True,
+                            scale_each=True
+                        )
+                        tb_tracker = accelerator.get_tracker("tensorboard")
+                        if tb_tracker is not None:
+                            tb_tracker.writer.add_image("Gen/MRI_Pred_GT_CenterSlice", img_grid, epoch)
+
+            # Free sampling memory before resuming training
+            del sample_batch, mr_samples, ct_samples
+            if sample_mask is not None:
+                del sample_mask
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            model.train()
+        
+        # =====================================================================
+        # Validation
+        # =====================================================================
+        if val_loader is not None and (epoch + 1) % cfg["val_every"] == 0:
+            model.eval()
+            val_loss_accum = 0.0
+            val_valid_patches = 0
+            
+            with torch.no_grad(), (ema.average_parameters() if ema is not None else nullcontext()):
+                for batch in val_loader:
+                    mr = batch["mr"]
+                    ct = batch["ct"]
+                    val_body_mask = batch.get("mask", None)
+                    
+                    sigma = sample_sigma(
+                        batch_size=ct.shape[0],
+                        P_mean=cfg["P_mean"],
+                        P_std=cfg["P_std"],
+                        sigma_min=cfg["sigma_min"],
+                        sigma_max=cfg["sigma_max"],
+                        device=accelerator.device,
+                    )
+                    
+                    loss, val_metrics = edm_loss(
+                        model, ct, mr, sigma,
+                        sigma_data=cfg["sigma_data"],
+                        loss_type=cfg["loss_type"],
+                        pfgmpp=cfg.get("pfgmpp", False),
+                        D=cfg.get("D", 128),
+                        body_mask=val_body_mask,
+                        return_patch_losses=True,
+                    )
+                    
+                    # gather_for_metrics removes Accelerate's final-batch padding.
+                    patch_losses, patch_valid = accelerator.gather_for_metrics((
+                        val_metrics['patch_losses'], val_metrics['patch_valid'],
+                    ))
+                    val_loss_accum += patch_losses[patch_valid].sum().item()
+                    val_valid_patches += patch_valid.sum().item()
+            
+            if val_valid_patches == 0:
+                raise ValueError("Validation set contained no foreground patches")
+            avg_val_loss = val_loss_accum / val_valid_patches
+            accelerator.log({"val/loss": avg_val_loss}, step=epoch)
+            
+            if accelerator.is_main_process:
+                print(f"  Validation: loss={avg_val_loss:.3e}")
+            
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                save_training_checkpoint(
+                    accelerator, model, ema, output_dir / "checkpoints" / "best",
+                    epoch + 1, global_step, {"metric": "val/loss", "value": avg_val_loss},
+                )
+                if accelerator.is_main_process:
+                    print(f"  New best model saved!")
+            
+            # Free validation loss memory before generation
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Validation sample generation
+            val_sample_batch = collect_generation_batch(val_loader, cfg["num_val_samples"])
+            mr_val_samples = val_sample_batch["mr"][:cfg["num_val_samples"]]
+            ct_val_samples = val_sample_batch["ct"][:cfg["num_val_samples"]]
+            val_sample_mask = val_sample_batch.get("mask", None)
+            if val_sample_mask is not None:
+                val_sample_mask = val_sample_mask[:cfg["num_val_samples"]]
+            
+            generation_mae = float("inf")
+            if accelerator.is_main_process and psnr_metric is not None:
+                unwrapped_model = accelerator.unwrap_model(model)
+                
+                with (ema.average_parameters() if ema is not None else nullcontext()):
+                    val_sample_kwargs = dict(
                         num_steps=cfg["num_sample_steps"],
                         sigma_min=cfg["sigma_min"],
                         sigma_max=cfg["sigma_max"],
@@ -1444,241 +1665,69 @@ def train(cfg: dict):
                         use_dynamic_cfg=cfg.get("use_dynamic_cfg", False),
                         cfg_scale_min=cfg.get("cfg_scale_min", 1.0),
                         cfg_scale_max=cfg.get("cfg_scale_max", 3.0),
-                        mask=sample_mask.to(accelerator.device) if sample_mask is not None else None,
+                        mask=val_sample_mask.to(accelerator.device) if val_sample_mask is not None else None,
                     )
-                    
-                    if cfg.get("log_ode_trajectory", False):
-                        pred_ct, ode_stats = edm_sample(
-                            unwrapped_model, mr_samples,
-                            return_trajectory_stats=True,
-                            **sample_kwargs,
-                        )
-                        accelerator.log({
-                            "ode/initial_norm": ode_stats['initial_norm'],
-                            "ode/final_norm": ode_stats['final_norm'],
-                            "ode/mean_denoised_norm": ode_stats['mean_denoised_norm'],
-                            "ode/mean_score_norm": ode_stats['mean_score_norm'],
-                            "ode/mean_update_norm": ode_stats['mean_update_norm'],
-                        }, step=epoch)
-                    else:
-                        pred_ct = edm_sample(
-                            unwrapped_model, mr_samples,
-                            **sample_kwargs,
-                        )
-                    
-                    # Extract center slice for visualization [B, 1, D, H, W] → [B, 1, H, W]
+                
+                    pred_val_ct = sample_generation_batches(
+                        unwrapped_model, mr_val_samples, cfg["batch_size"],
+                        use_tta=cfg.get("use_tta", False),
+                        tta_flips=cfg.get("tta_flips", ["lr", "ud", "lr_ud"]),
+                        **val_sample_kwargs,
+                    )
+
+                    # Extract center slice for metrics and visualization
                     center_idx = cfg["num_slices"] // 2
-                    pred_ct_center = pred_ct[:, :, center_idx, :, :]
-                    ct_samples_center = ct_samples[:, :, center_idx, :, :]
-                    mr_samples_center = mr_samples[:, :, center_idx, :, :]
-                    
-                    pred_ct_center = torch.clamp(pred_ct_center, -1.0, 1.0)
-                    pred_ct_01 = (pred_ct_center + 1.0) / 2.0
-                    ct_samples_01 = (ct_samples_center + 1.0) / 2.0
-                    
-                    # Prepare mask for metrics (extract center slice)
-                    mask_for_metrics = None
-                    if sample_mask is not None and cfg.get("use_body_mask", False):
-                        mask_for_metrics = sample_mask[:, :, center_idx, :, :].to(pred_ct.device)
-                    
-                    if psnr_metric is not None:
-                        gen_metrics = compute_masked_metrics(
-                            pred_ct_01, ct_samples_01,
-                            mask=mask_for_metrics,
-                            psnr_metric=psnr_metric,
-                            ssim_metric=ssim_metric,
-                            mae_metric=mae_metric,
-                        )
-                        
-                        log_dict = {
-                            "gen/psnr": gen_metrics.get('psnr', 0.0),
-                            "gen/ssim": gen_metrics.get('ssim', 0.0),
-                        }
-                        if 'mae' in gen_metrics:
-                            log_dict["gen/mae"] = gen_metrics['mae']
-                        
-                        accelerator.log(log_dict, step=epoch)
-                        mae_str = f", MAE={gen_metrics['mae']:.5f}" if 'mae' in gen_metrics else ""
-                        mask_str = " (masked)" if mask_for_metrics is not None else ""
-                        print(f"  Generation{mask_str} (center slice): PSNR={gen_metrics.get('psnr', 0.0):.3f}, SSIM={gen_metrics.get('ssim', 0.0):.5f}{mae_str}")
-                    
-                    # Log training sample images to TensorBoard
-                    img_grid = vutils.make_grid(
-                        torch.cat([mr_samples_center.cpu(), pred_ct_center.cpu(), ct_samples_center.cpu()], dim=0),
+                    pred_val_center = pred_val_ct[:, :, center_idx, :, :]
+                    ct_val_center = ct_val_samples[:, :, center_idx, :, :]
+                    mr_val_center = mr_val_samples[:, :, center_idx, :, :]
+                
+                    pred_val_center = torch.clamp(pred_val_center, -1.0, 1.0)
+                    pred_val_ct_01 = (pred_val_center + 1.0) / 2.0
+                    ct_val_samples_01 = (ct_val_center + 1.0) / 2.0
+                
+                    # Prepare mask for validation metrics (center slice)
+                    val_mask_for_metrics = None
+                    if val_sample_mask is not None and cfg.get("use_body_mask", False):
+                        val_mask_for_metrics = val_sample_mask[:, :, center_idx, :, :].to(pred_val_ct.device)
+                
+                    val_gen_metrics = compute_masked_metrics(
+                        pred_val_ct_01, ct_val_samples_01,
+                        mask=val_mask_for_metrics,
+                        psnr_metric=psnr_metric,
+                        ssim_metric=ssim_metric,
+                        mae_metric=mae_metric,
+                    )
+                
+                    val_gen_log = {f"val_gen/{key}": value for key, value in val_gen_metrics.items()
+                                   if math.isfinite(value)}
+                    generation_mae = val_gen_metrics.get('mae', float('inf'))
+                    accelerator.log(val_gen_log, step=epoch)
+
+                    val_mae_str = f", MAE={val_gen_metrics['mae']:.5f}" if 'mae' in val_gen_metrics else ""
+                    val_mask_str = " (masked)" if val_mask_for_metrics is not None else ""
+                    print(f"  Val Generation{val_mask_str} (center slice): PSNR={val_gen_metrics.get('psnr', 0.0):.3f}, SSIM={val_gen_metrics.get('ssim', 0.0):.5f}{val_mae_str}")
+                
+                    # Log validation sample images to TensorBoard
+                    val_img_grid = vutils.make_grid(
+                        torch.cat([mr_val_center.cpu(), pred_val_center.cpu(), ct_val_center.cpu()], dim=0),
                         nrow=cfg["num_val_samples"],
                         normalize=True,
                         scale_each=True
                     )
                     tb_tracker = accelerator.get_tracker("tensorboard")
                     if tb_tracker is not None:
-                        tb_tracker.writer.add_image("Gen/MRI_Pred_GT_CenterSlice", img_grid, epoch)
-                    
-                    # Restore original weights after EMA sampling
-                    if ema is not None:
-                        ema.restore()
-            
-            # Free sampling memory before resuming training
-            del sample_batch, mr_samples, ct_samples
-            if sample_mask is not None:
-                del sample_mask
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            model.train()
-        
-        # =====================================================================
-        # Validation
-        # =====================================================================
-        if val_loader is not None and (epoch + 1) % cfg["val_every"] == 0:
-            model.eval()
-            val_loss_accum = 0.0
-            val_batches = 0
-            
-            with torch.no_grad():
-                for batch in val_loader:
-                    mr = batch["mr"]
-                    ct = batch["ct"]
-                    val_body_mask = batch.get("mask", None)
-                    
-                    sigma = sample_sigma(
-                        batch_size=ct.shape[0],
-                        P_mean=cfg["P_mean"],
-                        P_std=cfg["P_std"],
-                        sigma_min=cfg["sigma_min"],
-                        sigma_max=cfg["sigma_max"],
-                        device=accelerator.device,
-                    )
-                    
-                    loss, _ = edm_loss(
-                        model, ct, mr, sigma,
-                        sigma_data=cfg["sigma_data"],
-                        loss_type=cfg["loss_type"],
-                        pfgmpp=cfg.get("pfgmpp", False),
-                        D=cfg.get("D", 128),
-                        body_mask=val_body_mask,
-                    )
-                    
-                    gathered_loss = accelerator.gather(loss.detach()).mean()
-                    val_loss_accum += gathered_loss.item()
-                    val_batches += 1
-            
-            avg_val_loss = val_loss_accum / val_batches
-            accelerator.log({"val/loss": avg_val_loss}, step=epoch)
-            
-            if accelerator.is_main_process:
-                print(f"  Validation: loss={avg_val_loss:.3e}")
-            
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                accelerator.save_state(output_dir / "checkpoints" / "best")
-                if accelerator.is_main_process:
-                    print(f"  New best model saved!")
-            
-            # Free validation loss memory before generation
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            # Validation sample generation
-            val_sample_batch = next(iter(val_loader))
-            mr_val_samples = val_sample_batch["mr"][:cfg["num_val_samples"]]
-            ct_val_samples = val_sample_batch["ct"][:cfg["num_val_samples"]]
-            val_sample_mask = val_sample_batch.get("mask", None)
-            if val_sample_mask is not None:
-                val_sample_mask = val_sample_mask[:cfg["num_val_samples"]]
-            
-            if accelerator.is_main_process and psnr_metric is not None:
-                unwrapped_model = accelerator.unwrap_model(model)
-                
-                # Apply EMA weights
-                if ema is not None:
-                    ema.apply_shadow()
-                
-                val_sample_kwargs = dict(
-                    num_steps=cfg["num_sample_steps"],
-                    sigma_min=cfg["sigma_min"],
-                    sigma_max=cfg["sigma_max"],
-                    sigma_data=cfg["sigma_data"],
-                    rho=cfg["rho"],
-                    S_churn=cfg.get("S_churn", 0.0),
-                    S_min=cfg.get("S_min", 0.0),
-                    S_max=cfg.get("S_max", float('inf')),
-                    S_noise=cfg.get("S_noise", 1.0),
-                    cfg_scale=cfg.get("cfg_scale", 1.0),
-                    pfgmpp=cfg.get("pfgmpp", False),
-                    D=cfg.get("D", 128),
-                    use_cfg_plus_plus=cfg.get("use_cfg_plus_plus", False),
-                    cfg_rescale_factor=cfg.get("cfg_rescale_factor", 0.7),
-                    use_dynamic_cfg=cfg.get("use_dynamic_cfg", False),
-                    cfg_scale_min=cfg.get("cfg_scale_min", 1.0),
-                    cfg_scale_max=cfg.get("cfg_scale_max", 3.0),
-                    mask=val_sample_mask.to(accelerator.device) if val_sample_mask is not None else None,
+                        tb_tracker.writer.add_image("Val_Gen/MRI_Pred_GT_CenterSlice", val_img_grid, epoch)
+
+            # All ranks save together, after restoring raw training weights.
+            score = accelerator.gather(torch.tensor([generation_mae], device=accelerator.device)).min().item()
+            if math.isfinite(score) and score < best_gen_mae:
+                best_gen_mae = score
+                save_training_checkpoint(
+                    accelerator, model, ema, output_dir / "checkpoints" / "best_generation",
+                    epoch + 1, global_step, {"metric": "val_gen/mae", "value": score,
+                                             "scope": "sampled center slices"},
                 )
-                
-                if cfg.get("use_tta", False):
-                    pred_val_ct = edm_sample_tta(
-                        unwrapped_model, mr_val_samples,
-                        tta_flips=cfg.get("tta_flips", ["lr", "ud", "lr_ud"]),
-                        **val_sample_kwargs,
-                    )
-                else:
-                    pred_val_ct = edm_sample(
-                        unwrapped_model, mr_val_samples,
-                        **val_sample_kwargs,
-                    )
-                
-                # Extract center slice for metrics and visualization
-                center_idx = cfg["num_slices"] // 2
-                pred_val_center = pred_val_ct[:, :, center_idx, :, :]
-                ct_val_center = ct_val_samples[:, :, center_idx, :, :]
-                mr_val_center = mr_val_samples[:, :, center_idx, :, :]
-                
-                pred_val_center = torch.clamp(pred_val_center, -1.0, 1.0)
-                pred_val_ct_01 = (pred_val_center + 1.0) / 2.0
-                ct_val_samples_01 = (ct_val_center + 1.0) / 2.0
-                
-                # Prepare mask for validation metrics (center slice)
-                val_mask_for_metrics = None
-                if val_sample_mask is not None and cfg.get("use_body_mask", False):
-                    val_mask_for_metrics = val_sample_mask[:, :, center_idx, :, :].to(pred_val_ct.device)
-                
-                val_gen_metrics = compute_masked_metrics(
-                    pred_val_ct_01, ct_val_samples_01,
-                    mask=val_mask_for_metrics,
-                    psnr_metric=psnr_metric,
-                    ssim_metric=ssim_metric,
-                    mae_metric=mae_metric,
-                )
-                
-                val_gen_log = {
-                    "val_gen/psnr": val_gen_metrics.get('psnr', 0.0),
-                    "val_gen/ssim": val_gen_metrics.get('ssim', 0.0),
-                }
-                if 'mae' in val_gen_metrics:
-                    val_gen_log["val_gen/mae"] = val_gen_metrics['mae']
-                
-                accelerator.log(val_gen_log, step=epoch)
-                
-                val_mae_str = f", MAE={val_gen_metrics['mae']:.5f}" if 'mae' in val_gen_metrics else ""
-                val_mask_str = " (masked)" if val_mask_for_metrics is not None else ""
-                print(f"  Val Generation{val_mask_str} (center slice): PSNR={val_gen_metrics.get('psnr', 0.0):.3f}, SSIM={val_gen_metrics.get('ssim', 0.0):.5f}{val_mae_str}")
-                
-                # Log validation sample images to TensorBoard
-                val_img_grid = vutils.make_grid(
-                    torch.cat([mr_val_center.cpu(), pred_val_center.cpu(), ct_val_center.cpu()], dim=0),
-                    nrow=cfg["num_val_samples"],
-                    normalize=True,
-                    scale_each=True
-                )
-                tb_tracker = accelerator.get_tracker("tensorboard")
-                if tb_tracker is not None:
-                    tb_tracker.writer.add_image("Val_Gen/MRI_Pred_GT_CenterSlice", val_img_grid, epoch)
-                
-                # Restore original weights
-                if ema is not None:
-                    ema.restore()
-            
+
             # Free validation generation memory
             del val_sample_batch, mr_val_samples, ct_val_samples
             if val_sample_mask is not None:
@@ -1693,12 +1742,15 @@ def train(cfg: dict):
         # Save checkpoint
         # =====================================================================
         if (epoch + 1) % cfg["save_every"] == 0:
-            accelerator.save_state(output_dir / "checkpoints" / f"epoch_{epoch+1:04d}")
+            save_training_checkpoint(accelerator, model, ema,
+                                     output_dir / "checkpoints" / f"epoch_{epoch+1:04d}",
+                                     epoch + 1, global_step)
             if accelerator.is_main_process:
                 print(f"  Checkpoint saved")
     
     # Final save
-    accelerator.save_state(output_dir / "checkpoints" / "final")
+    save_training_checkpoint(accelerator, model, ema, output_dir / "checkpoints" / "final",
+                             cfg["num_epochs"], global_step)
     accelerator.end_training()
     
     if accelerator.is_main_process:
@@ -1736,7 +1788,7 @@ def load_config(path=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=Path, help="JSON overrides for the default configuration")
-    parser.add_argument("--data-dir", type=Path, help="Directory of paired, normalized NIfTI patient folders")
+    parser.add_argument("--data-dir", type=Path, nargs="+", help="One or more directories of paired, normalized NIfTI patient folders")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int)
@@ -1750,6 +1802,8 @@ def main():
                       ("num_workers", "num_workers")]:
         value = getattr(args, name)
         if value is not None:
+            if name == "data_dir":
+                value = [str(path) for path in value] if len(value) > 1 else value[0]
             cfg[key] = str(value) if isinstance(value, Path) else value
     if args.cpu:
         cfg["cpu"] = True
@@ -1762,12 +1816,16 @@ def main():
         return
     if not cfg["data_dir"]:
         parser.error("provide --data-dir or data_dir in --config")
-    if not Path(cfg["data_dir"]).is_dir():
-        parser.error("data_dir must be an existing directory")
+    data_dirs = cfg["data_dir"] if isinstance(cfg["data_dir"], list) else [cfg["data_dir"]]
+    for data_dir in data_dirs:
+        if not Path(data_dir).is_dir():
+            parser.error(f"data_dir must be an existing directory: {data_dir}")
     if cfg.get("resume"):
         parser.error("checkpoint resume is not implemented; resume must be null")
     if cfg["num_epochs"] < 1 or cfg["batch_size"] < 1 or cfg["num_workers"] < 0:
         parser.error("epochs and batch size must be positive; workers must be nonnegative")
+    if cfg["num_val_samples"] < 1:
+        parser.error("num_val_samples must be positive")
     if cfg["num_slices"] < 2 or cfg["num_slices"] % 2:
         parser.error("use an even num_slices of at least 2 for the current loader")
     train(cfg)
